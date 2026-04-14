@@ -1,5 +1,6 @@
 package com.chess.engine;
 
+import jakarta.servlet.http.HttpSession;
 import java.util.List;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -33,12 +34,60 @@ public class ChessController {
     }
 
     // NEW: Endpoint for players to claim an identity when they open the link
+    // We completely removed HttpSession!
     @GetMapping("/join")
-    public String joinGame() {
-        if (unassignedColors.isEmpty()) {
-            return "SPECTATOR"; // If 2 people are already playing, anyone else just watches
+    public String join(@RequestParam(required = false) String token) {
+        return game.assignPlayer(token);
+    }
+
+    @GetMapping("/sync")
+    public Map<String, Object> syncGameState() {
+        Map<String, Object> state = new HashMap<>();
+        state.put("grid", getBoardState());
+        state.put("whiteTime", game.getWhiteTimeRemaining());
+        state.put("blackTime", game.getBlackTimeRemaining());
+        state.put("moveHistory", game.getMoveHistory());
+
+        // NEW: Tell the browser if the match is actively running!
+        state.put("matchStarted", game.isMatchStarted());
+        return state;
+    }
+
+    // NEW: Endpoint for the Ready Button
+    @GetMapping("/ready")
+    public String playerReady(@RequestParam String color) {
+        boolean isStarting = game.setPlayerReady(color);
+
+        // ONLY broadcast if the match is officially starting!
+        if (isStarting) {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("type", "START");
+            messagingTemplate.convertAndSend("/topic/game", (Object) payload);
         }
-        return unassignedColors.remove(0); // Hand them a random color
+
+        return "OK";
+    }
+
+    // NEW: Endpoint for Resign / Abort
+    @GetMapping("/action")
+    public String playerAction(@RequestParam String action, @RequestParam String color) {
+        String status = "RESIGN".equals(action) ? game.resign(color) : game.abort();
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "MOVE"); // We pretend it's a move so JS handles it naturally
+        payload.put("status", status);
+        payload.put("grid", getBoardState());
+        payload.put("pieceCode", "");
+        payload.put("startX", 0); payload.put("startY", 0);
+        payload.put("endX", 0); payload.put("endY", 0);
+        payload.put("whiteTime", game.getWhiteTimeRemaining());
+        payload.put("blackTime", game.getBlackTimeRemaining());
+
+        // Save the game-ending action to memory
+        game.addMoveToHistory(payload);
+
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+        return status;
     }
 
     // This creates a link: http://localhost:8080/validMoves?startX=...&startY=...
@@ -72,7 +121,11 @@ public class ChessController {
             // NEW: Add the official server time to the broadcast
             payload.put("whiteTime", game.getWhiteTimeRemaining());
             payload.put("blackTime", game.getBlackTimeRemaining());
+
+            // Save the payload to the server's memory bank!
+            game.addMoveToHistory(payload);
             // Blast it to the "/topic/game" radio channel
+
             messagingTemplate.convertAndSend("/topic/game", (Object) payload);
         }
 
@@ -81,19 +134,16 @@ public class ChessController {
 
     // A handy link to restart the game: http://localhost:8080/reset
     @GetMapping("/reset")
-    public String resetGame() {
-        this.game = new Game();
+    public String reset() {
+        // 1. Trigger the master reset switch in Game.java
+        game.resetGame();
 
-        // Refill and shuffle the bucket for the next game!
-        unassignedColors = new ArrayList<>(Arrays.asList("WHITE", "BLACK"));
-        Collections.shuffle(unassignedColors);
-
-        // Blast the reset signal to all players
-        Map<String, Object> payload = new HashMap<>();
+        // 2. Broadcast the reset command to all connected browsers
+        Map<String, String> payload = new HashMap<>();
         payload.put("type", "RESET");
-        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+        messagingTemplate.convertAndSend("/topic/game", payload);
 
-        return "SUCCESS: New game started!";
+        return "Reset successful";
     }
 
     // This creates a web link: http://localhost:8080/board
@@ -130,6 +180,7 @@ public class ChessController {
         }
         return grid;
     }
+
     // NEW: Endpoint for the frontend to trigger a timeout check
     @GetMapping("/timeout")
     public String triggerTimeout() {

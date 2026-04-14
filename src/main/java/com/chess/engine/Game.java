@@ -1,9 +1,80 @@
 package com.chess.engine;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+
 public class Game {
+    // NEW: The Server-Side Memory Bank
+    private List<Map<String, Object>> moveHistory = new ArrayList<>();
     private Board board;
     private Color currentTurn;
+
+    // --- NEW: SECRET TOKEN TRACKERS ---
+    private String whiteToken = null;
+    private String blackToken = null;
+
+    // We now accept a token to check if the player is returning!
+    public String assignPlayer(String returningToken) {
+
+        // 1. Welcome back returning players!
+        if (returningToken != null && !returningToken.isEmpty()) {
+            if (returningToken.equals(whiteToken)) return whiteToken;
+            if (returningToken.equals(blackToken)) return blackToken;
+        }
+
+        // 2. Assign empty seats to new players and generate a secret token
+        if (whiteToken == null) {
+            whiteToken = "WHITE-" + java.util.UUID.randomUUID().toString();
+            return whiteToken;
+        }
+        if (blackToken == null) {
+            blackToken = "BLACK-" + java.util.UUID.randomUUID().toString();
+            return blackToken;
+        }
+
+        return "SPECTATOR";
+    }
+
+    // Allows the Controller to ask if the match is running
+    public boolean isMatchStarted() {
+        return matchStarted;
+    }
+
+    // --- NEW: LOBBY TRACKERS ---
+    private boolean whiteReady = false;
+    private boolean blackReady = false;
+    private boolean matchStarted = false;
+
+    // Call this when a player clicks "Ready"
+    public boolean setPlayerReady(String color) {
+        if ("WHITE".equals(color)) whiteReady = true;
+        if ("BLACK".equals(color)) blackReady = true;
+
+        if (whiteReady && blackReady) {
+            matchStarted = true;
+            // START THE CLOCKS NOW!
+            lastMoveTimestamp = System.currentTimeMillis();
+            return true; // Returns true if the match just officially started
+        }
+        return false;
+    }
+
+    // NEW: Action Handlers for Resign and Abort
+    public String resign(String color) {
+        return "RESIGNATION! " + ("WHITE".equals(color) ? "BLACK wins!" : "WHITE wins!");
+    }
+
+    public String abort() {
+        return "MATCH ABORTED! Game cancelled.";
+    }
+
+    public List<Map<String, Object>> getMoveHistory() {
+        return moveHistory;
+    }
+
+    public void addMoveToHistory(Map<String, Object> movePayload) {
+        moveHistory.add(movePayload);
+    }
 
     // --- DRAW TRACKERS ---
     // Counts moves. Resets to 0 if a pawn moves or a piece is captured. Hits 100 = Draw.
@@ -12,18 +83,61 @@ public class Game {
     // Remembers board positions to check for Threefold Repetition
     private java.util.Map<String, Integer> positionHistory = new java.util.HashMap<>();
 
-    // --- NEW: CLOCK TRACKERS ---
+    // --- CLOCK TRACKERS ---
     private long whiteTimeRemaining = 10 * 60 * 1000; // 10 minutes in milliseconds
     private long blackTimeRemaining = 10 * 60 * 1000;
     private long lastMoveTimestamp = System.currentTimeMillis();
 
-    // Add these getters so the Controller can read the time
-    public long getWhiteTimeRemaining() { return whiteTimeRemaining; }
-    public long getBlackTimeRemaining() { return blackTimeRemaining; }
+
+    // LIVE TIME CALCULATION
+    public long getWhiteTimeRemaining() {
+        // If the match is actively running, and it is White's turn, calculate the exact live time!
+        if (matchStarted && currentTurn == Color.WHITE) {
+            long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
+            return whiteTimeRemaining - elapsed;
+        }
+        // Otherwise, return their frozen time
+        return whiteTimeRemaining;
+    }
+
+    public long getBlackTimeRemaining() {
+        // If the match is actively running, and it is Black's turn, calculate the exact live time!
+        if (matchStarted && currentTurn == Color.BLACK) {
+            long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
+            return blackTimeRemaining - elapsed;
+        }
+        // Otherwise, return their frozen time
+        return blackTimeRemaining;
+    }
 
     public Game() {
         board = new Board();
         currentTurn = Color.WHITE; // White always goes first in chess
+    }
+
+    // ==========================================
+    // --- MASTER RESET METHOD ---
+    // ==========================================
+    public void resetGame() {
+        this.board = new Board();       // Get a fresh board
+        this.currentTurn = Color.WHITE; // White goes first
+
+        // 1. Reset Lobby & Match State
+        this.whiteReady = false;
+        this.blackReady = false;
+        this.matchStarted = false;
+
+        // 2. Reset Draw Trackers
+        this.halfMoveClock = 0;
+        this.positionHistory.clear();
+
+        // 3. Reset Clocks
+        this.whiteTimeRemaining = 10 * 60 * 1000;
+        this.blackTimeRemaining = 10 * 60 * 1000;
+        this.lastMoveTimestamp = System.currentTimeMillis();
+
+        // 4. Wipe the Server Memory Bank!
+        this.moveHistory.clear();
     }
 
     public Board getBoard() {
