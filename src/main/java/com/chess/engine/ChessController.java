@@ -146,6 +146,23 @@ public class ChessController {
         return "Reset successful";
     }
 
+    // --- NEW: Arcade Cabinet Reset ---
+    @GetMapping("/leave")
+    public String leaveTable() {
+        // 1. Wipe the secret tokens
+        game.clearSeats();
+
+        // 2. Wipe the board and clocks
+        game.resetGame();
+
+        // 3. Tell EVERY connected browser to forcefully refresh!
+        Map<String, String> payload = new HashMap<>();
+        payload.put("type", "KICK");
+        messagingTemplate.convertAndSend("/topic/game", payload);
+
+        return "Table Cleared";
+    }
+
     // This creates a web link: http://localhost:8080/board
     @GetMapping("/board")
     public String[][] getBoardState() {

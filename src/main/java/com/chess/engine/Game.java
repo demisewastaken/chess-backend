@@ -140,6 +140,14 @@ public class Game {
         this.moveHistory.clear();
     }
 
+    // ==========================================
+    // --- NEW: LEAVE TABLE METHOD ---
+    // ==========================================
+    public void clearSeats() {
+        this.whiteToken = null;
+        this.blackToken = null;
+    }
+
     public Board getBoard() {
         return board;
     }
