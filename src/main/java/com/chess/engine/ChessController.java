@@ -186,6 +186,10 @@ public class ChessController {
     // THE ABANDONMENT FIX: Award the win to the remaining player
     // ==========================================
     public void handleAbandonment(String droppedColor) {
+        if (!game.isMatchStarted()) {
+            System.out.println("Match is already over. Ignoring abandonment for " + droppedColor);
+            return;
+        }
         // 1. Force the backend game engine to officially end the match
         game.resign(droppedColor);
 
