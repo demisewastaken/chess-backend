@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.messaging.SessionDisconnectEvent;
 import org.springframework.messaging.simp.SimpMessageSendingOperations;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.*;
 
@@ -49,8 +50,10 @@ public class WebSocketEventListener {
         }
 
         System.out.println("⚠️ WARNING: " + droppedColor + " disconnected. Starting 60-second grace period...");
-
-        // Start the 60-second Doomsday Clock
+        Map<String, String> warningPayload = new HashMap<>();
+        warningPayload.put("type", "DISCONNECT_WARNING");
+        warningPayload.put("color", droppedColor);
+        messagingTemplate.convertAndSend("/topic/game", (Object) warningPayload);
         // Start the 60-second Doomsday Clock
         ScheduledFuture<?> doomsdayClock = scheduler.schedule(() -> {
 
@@ -84,6 +87,10 @@ public class WebSocketEventListener {
             activeTimer.cancel(false);
             disconnectTimers.remove(color);
             System.out.println("✅ RECONNECTED: " + color + " returned to the game. Timer canceled.");
+            Map<String, String> reconnectPayload = new HashMap<>();
+            reconnectPayload.put("type", "RECONNECT_SUCCESS");
+            reconnectPayload.put("color", color);
+            messagingTemplate.convertAndSend("/topic/game", (Object) reconnectPayload);
         }
     }
 }
