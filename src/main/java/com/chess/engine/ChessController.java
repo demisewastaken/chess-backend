@@ -13,6 +13,9 @@ import java.util.Map;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import org.springframework.messaging.handler.annotation.Header;
+import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.messaging.handler.annotation.Payload;
 
 
 @RestController // Tells Spring Boot: "This class is a Waiter that listens to the internet"
@@ -21,6 +24,9 @@ public class ChessController {
 
     @Autowired
     private SimpMessagingTemplate messagingTemplate;
+
+    @Autowired
+    private WebSocketEventListener webSocketEventListener;
 
     private Game game = new Game();
 
@@ -33,6 +39,19 @@ public class ChessController {
         Collections.shuffle(unassignedColors);
     }
 
+    // ==========================================
+    // THE RECONNECT FIX: Link STOMP Sessions to Players
+    // =========================================
+    @MessageMapping("/register")
+    public void registerSession(@Payload String color, @Header("simpSessionId") String sessionId) {
+        // STOMP sometimes sends strings with literal quotes like ""WHITE"". This cleans it up!
+        String cleanColor = color.replace("\"", "").trim();
+
+        // Add a print statement so we can visibly PROVE the handshake worked
+        System.out.println("🔗 HANDSHAKE SUCCESS: " + cleanColor + " registered to session " + sessionId);
+
+        webSocketEventListener.registerPlayerSession(sessionId, cleanColor);
+    }
     // NEW: Endpoint for players to claim an identity when they open the link
     // We completely removed HttpSession!
     @GetMapping("/join")
@@ -161,6 +180,33 @@ public class ChessController {
         messagingTemplate.convertAndSend("/topic/game", payload);
 
         return "Table Cleared";
+    }
+
+    // ==========================================
+    // THE ABANDONMENT FIX: Award the win to the remaining player
+    // ==========================================
+    public void handleAbandonment(String droppedColor) {
+        // 1. Force the backend game engine to officially end the match
+        game.resign(droppedColor);
+
+        // 2. Determine the winner
+        String winner = droppedColor.equals("WHITE") ? "Black" : "White";
+        String status = droppedColor + " ABANDONED. " + winner + " wins!";
+
+        // 3. Build a "Game Over" payload that the frontend already knows how to read!
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "MOVE"); // Pretend it's a move so the JS overlay triggers naturally
+        payload.put("status", status);
+        payload.put("grid", getBoardState());
+        payload.put("pieceCode", "");
+        payload.put("startX", 0); payload.put("startY", 0);
+        payload.put("endX", 0); payload.put("endY", 0);
+        payload.put("whiteTime", game.getWhiteTimeRemaining());
+        payload.put("blackTime", game.getBlackTimeRemaining());
+
+        // Save it to history and broadcast it
+        game.addMoveToHistory(payload);
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
     }
 
     // This creates a web link: http://localhost:8080/board
