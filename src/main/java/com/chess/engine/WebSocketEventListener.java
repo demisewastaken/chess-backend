@@ -26,7 +26,7 @@ public class WebSocketEventListener {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
     // Maps a player's color ("WHITE" or "BLACK") to their active countdown timer
-    private final Map<String, ScheduledFuture<?>> disconnectTimers = new ConcurrentHashMap<>();
+    public static final Map<String, ScheduledFuture<?>> disconnectTimers = new ConcurrentHashMap<>();
 
     // Maps a WebSocket Session ID to a player's Color
     private final Map<String, String> sessionToColorMap = new ConcurrentHashMap<>();

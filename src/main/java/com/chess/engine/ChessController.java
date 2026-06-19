@@ -51,6 +51,7 @@ public class ChessController {
         System.out.println("🔗 HANDSHAKE SUCCESS: " + cleanColor + " registered to session " + sessionId);
 
         webSocketEventListener.registerPlayerSession(sessionId, cleanColor);
+        disarmGhostTimer(cleanColor);
     }
     // NEW: Endpoint for players to claim an identity when they open the link
     // We completely removed HttpSession!
@@ -90,6 +91,8 @@ public class ChessController {
     // NEW: Endpoint for Resign / Abort
     @GetMapping("/action")
     public String playerAction(@RequestParam String action, @RequestParam String color) {
+        disarmGhostTimer(color);
+
         String status = "RESIGN".equals(action) ? game.resign(color) : game.abort();
 
         Map<String, Object> payload = new HashMap<>();
@@ -122,6 +125,11 @@ public class ChessController {
                             @RequestParam int endX, @RequestParam int endY,
                             @RequestParam(required = false) String promotion,
                             @RequestParam String pieceCode) { // NEW: Ask JS what piece moved
+
+        if (pieceCode != null && !pieceCode.isEmpty()) {
+            String activeColor = pieceCode.startsWith("w") ? "WHITE" : "BLACK";
+            disarmGhostTimer(activeColor); // Disarm the ghost bomb!
+        }
 
         String status = game.playerMove(startX, startY, endX, endY, promotion);
 
@@ -271,5 +279,36 @@ public class ChessController {
         }
 
         return status;
+    }
+    // ==========================================
+    // THE GHOST BOMB DISARMER
+    // ==========================================
+    private void disarmGhostTimer(String color) {
+        if (color == null) return;
+
+        java.util.concurrent.ScheduledFuture<?> activeTimer = WebSocketEventListener.disconnectTimers.remove(color.toUpperCase());
+
+        if (activeTimer != null) {
+            activeTimer.cancel(true);
+            System.out.println("🛡️ GHOST BOMB DISARMED: Canceled lingering disconnect timer for " + color);
+
+            Map<String, String> reconnectPayload = new HashMap<>();
+            reconnectPayload.put("type", "RECONNECT_SUCCESS");
+            reconnectPayload.put("color", color);
+            messagingTemplate.convertAndSend("/topic/game", (Object) reconnectPayload);
+        }
+    }
+
+    // ==========================================
+    // IN-GAME CHAT SYSTEM
+    // ==========================================
+    @MessageMapping("/chat")
+    public void handleChat(Map<String, String> payload) {
+        // Disarm the ghost timer so chatting counts as being "active"
+        disarmGhostTimer(payload.get("sender"));
+
+        // Tag it as a chat message and broadcast it to both players
+        payload.put("type", "CHAT");
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
     }
 }
