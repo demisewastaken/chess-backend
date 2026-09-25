@@ -4,19 +4,17 @@ import java.util.List;
 import java.util.Map;
 
 public class Game {
-    // NEW: The Server-Side Memory Bank
+    // The Server-Side Memory Bank
     private List<Map<String, Object>> moveHistory = new ArrayList<>();
     private Board board;
     private Color currentTurn;
 
-    // --- NEW: SECRET TOKEN TRACKERS ---
+    // SECRET TOKEN TRACKERS
     private String whiteToken = null;
     private String blackToken = null;
 
-    // We now accept a token to check if the player is returning!
     public String assignPlayer(String returningToken) {
-
-        // 1. Welcome back returning players!
+        // 1. Welcome back returning players
         if (returningToken != null && !returningToken.isEmpty()) {
             if (returningToken.equals(whiteToken)) return whiteToken;
             if (returningToken.equals(blackToken)) return blackToken;
@@ -40,7 +38,7 @@ public class Game {
         return matchStarted;
     }
 
-    // --- NEW: LOBBY TRACKERS ---
+    // LOBBY TRACKERS
     private boolean whiteReady = false;
     private boolean blackReady = false;
     private boolean matchStarted = false;
@@ -52,19 +50,29 @@ public class Game {
 
         if (whiteReady && blackReady) {
             matchStarted = true;
-            // START THE CLOCKS NOW!
             lastMoveTimestamp = System.currentTimeMillis();
-            return true; // Returns true if the match just officially started
+            return true;
         }
         return false;
     }
 
-    // NEW: Action Handlers for Resign and Abort
+    // Marks the game as officially over and freezes the clocks
+    private void endMatch() {
+        matchStarted = false;
+        // Freeze the remaining time so subsequent /sync calls return stable values
+        whiteTimeRemaining = getWhiteTimeRemaining();
+        blackTimeRemaining = getBlackTimeRemaining();
+        lastMoveTimestamp = System.currentTimeMillis();
+    }
+
+    // Action Handlers for Resign and Abort
     public String resign(String color) {
+        endMatch();
         return "RESIGNATION! " + ("WHITE".equals(color) ? "BLACK wins!" : "WHITE wins!");
     }
 
     public String abort() {
+        endMatch();
         return "MATCH ABORTED! Game cancelled.";
     }
 
@@ -76,73 +84,71 @@ public class Game {
         moveHistory.add(movePayload);
     }
 
-    // --- DRAW TRACKERS ---
-    // Counts moves. Resets to 0 if a pawn moves or a piece is captured. Hits 100 = Draw.
+    // DRAW TRACKERS
+    // Counts half-moves. Resets to 0 on pawn move or capture. At 100 = 50-Move Draw.
     private int halfMoveClock = 0;
 
     // Remembers board positions to check for Threefold Repetition
     private java.util.Map<String, Integer> positionHistory = new java.util.HashMap<>();
 
-    // --- CLOCK TRACKERS ---
-    private long whiteTimeRemaining = 10 * 60 * 1000; // 10 minutes in milliseconds
+    // CLOCK TRACKERS
+    private long whiteTimeRemaining = 10 * 60 * 1000; // 10 minutes in ms
     private long blackTimeRemaining = 10 * 60 * 1000;
     private long lastMoveTimestamp = System.currentTimeMillis();
 
-
-    // LIVE TIME CALCULATION
+    // LIVE TIME CALCULATION — returns frozen time when match is not active
     public long getWhiteTimeRemaining() {
-        // If the match is actively running, and it is White's turn, calculate the exact live time!
         if (matchStarted && currentTurn == Color.WHITE) {
             long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
-            return whiteTimeRemaining - elapsed;
+            return Math.max(0, whiteTimeRemaining - elapsed);
         }
-        // Otherwise, return their frozen time
-        return whiteTimeRemaining;
+        return Math.max(0, whiteTimeRemaining);
     }
 
     public long getBlackTimeRemaining() {
-        // If the match is actively running, and it is Black's turn, calculate the exact live time!
         if (matchStarted && currentTurn == Color.BLACK) {
             long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
-            return blackTimeRemaining - elapsed;
+            return Math.max(0, blackTimeRemaining - elapsed);
         }
-        // Otherwise, return their frozen time
-        return blackTimeRemaining;
+        return Math.max(0, blackTimeRemaining);
     }
 
     public Game() {
         board = new Board();
-        currentTurn = Color.WHITE; // White always goes first in chess
+        currentTurn = Color.WHITE;
+    }
+
+    // Returns whose turn it currently is (used by controller for clock sync)
+    public Color getCurrentTurn() {
+        return currentTurn;
     }
 
     // ==========================================
-    // --- MASTER RESET METHOD ---
+    // MASTER RESET METHOD
     // ==========================================
     public void resetGame() {
-        this.board = new Board();       // Get a fresh board
-        this.currentTurn = Color.WHITE; // White goes first
+        this.board = new Board();
+        this.currentTurn = Color.WHITE;
 
-        // 1. Reset Lobby & Match State
+        // Reset Lobby & Match State
         this.whiteReady = false;
         this.blackReady = false;
         this.matchStarted = false;
 
-        // 2. Reset Draw Trackers
+        // Reset Draw Trackers
         this.halfMoveClock = 0;
         this.positionHistory.clear();
 
-        // 3. Reset Clocks
+        // Reset Clocks
         this.whiteTimeRemaining = 10 * 60 * 1000;
         this.blackTimeRemaining = 10 * 60 * 1000;
         this.lastMoveTimestamp = System.currentTimeMillis();
 
-        // 4. Wipe the Server Memory Bank!
+        // Wipe the Server Memory Bank
         this.moveHistory.clear();
     }
 
-    // ==========================================
-    // --- NEW: LEAVE TABLE METHOD ---
-    // ==========================================
+    // LEAVE TABLE METHOD
     public void clearSeats() {
         this.whiteToken = null;
         this.blackToken = null;
@@ -152,9 +158,15 @@ public class Game {
         return board;
     }
 
-    // The main engine method that processes a move
-
+    // ==========================================
+    // MAIN MOVE ENGINE
+    // ==========================================
     public String playerMove(int startX, int startY, int endX, int endY, String promotion) {
+        // Guard: reject moves if the match is not active
+        if (!matchStarted) {
+            return "ERROR: Match has not started!";
+        }
+
         Spot startBox = board.getBox(startX, startY);
         Spot endBox = board.getBox(endX, endY);
         Piece pieceToMove = startBox.getPiece();
@@ -175,105 +187,106 @@ public class Game {
             if (isKingInCheck(currentTurn)) {
                 return "ERROR: You cannot castle while in Check!";
             }
+            // Prevent Castling THROUGH an attacked square (transit square check)
+            int direction = (endY > startY) ? 1 : -1;
+            Spot transitSpot = board.getBox(startX, startY + direction);
+            if (isSquareAttackedBy(transitSpot, currentTurn == Color.WHITE ? Color.BLACK : Color.WHITE)) {
+                return "ERROR: You cannot castle through an attacked square!";
+            }
         }
 
-        // --- PHASE 2: THE "CHECK" SIMULATION ---
+        // --- PHASE 2: CHECK SIMULATION ---
+        // Temporarily make the move to see if it exposes our King
         Piece destPiece = endBox.getPiece();
         endBox.setPiece(pieceToMove);
         startBox.setPiece(null);
 
-        if (isKingInCheck(currentTurn)) {
-            //Undo the move
-            startBox.setPiece(pieceToMove);
-            endBox.setPiece(destPiece);
+        // For En Passant: also remove the captured pawn during simulation
+        Spot epVictimSpot = null;
+        Piece epVictim = null;
+        if (pieceToMove instanceof Pawn && startX != endX && startY != endY && destPiece == null) {
+            epVictimSpot = board.getBox(startX, endY);
+            epVictim = epVictimSpot.getPiece();
+            epVictimSpot.setPiece(null);
+        }
+
+        boolean stillInCheck = isKingInCheck(currentTurn);
+
+        // Undo the simulation
+        startBox.setPiece(pieceToMove);
+        endBox.setPiece(destPiece);
+        if (epVictimSpot != null) {
+            epVictimSpot.setPiece(epVictim);
+        }
+
+        if (stillInCheck) {
             return "ERROR: You cannot make a move that leaves your King in Check!";
         }
 
-        // ==========================================
-        // --- NEW: TIME MANAGEMENT ---
-        // ==========================================
+        // --- TIME MANAGEMENT ---
         long currentTime = System.currentTimeMillis();
         long elapsed = currentTime - lastMoveTimestamp;
 
         if (currentTurn == Color.WHITE) {
             whiteTimeRemaining -= elapsed;
-            if (whiteTimeRemaining <= 0) return "TIME_OUT! Black wins on time!";
+            if (whiteTimeRemaining <= 0) {
+                whiteTimeRemaining = 0;
+                endMatch();
+                return "TIME_OUT! Black wins on time!";
+            }
         } else {
             blackTimeRemaining -= elapsed;
-            if (blackTimeRemaining <= 0) return "TIME_OUT! White wins on time!";
+            if (blackTimeRemaining <= 0) {
+                blackTimeRemaining = 0;
+                endMatch();
+                return "TIME_OUT! White wins on time!";
+            }
         }
-
-        // Reset the stopwatch for the next player's turn!
         lastMoveTimestamp = currentTime;
 
         // --- PHASE 3: PERMANENT EXECUTION ---
 
-        // 50-MOVE RULE TRACKER
+        // Actually move the piece to its new position on the board.
+        // (The simulation in Phase 2 was fully undone — we must re-apply it permanently here.)
+        endBox.setPiece(pieceToMove);
+        startBox.setPiece(null);
+
+        // 50-Move Rule tracker
         if (pieceToMove instanceof Pawn || destPiece != null) {
-            halfMoveClock = 0; // Reset the clock
-            positionHistory.clear(); // Pawn moves/captures break repetition chains permanently
+            halfMoveClock = 0;
+            positionHistory.clear(); // Irreversible moves break repetition chains
         } else {
-            halfMoveClock++; // Tick the clock
+            halfMoveClock++;
         }
 
         if (destPiece != null) {
             destPiece.setKilled(true);
         }
 
-        // Execute En Passant Capture
+        // Execute En Passant capture
         if (pieceToMove instanceof Pawn && startX != endX && startY != endY && destPiece == null) {
-            Spot epVictimSpot = board.getBox(startX, endY);
-            if (epVictimSpot.getPiece() != null) {
-                epVictimSpot.getPiece().setKilled(true);
-                epVictimSpot.setPiece(null);
+            Spot victim = board.getBox(startX, endY);
+            if (victim.getPiece() != null) {
+                victim.getPiece().setKilled(true);
+                victim.setPiece(null);
             }
         }
 
         // Handle Pawn Promotion
         if (pieceToMove instanceof Pawn) {
             if ((currentTurn == Color.WHITE && endX == 7) || (currentTurn == Color.BLACK && endX == 0)) {
-                if (promotion != null && !promotion.isEmpty()) {
-                    Piece newPiece;
-                    switch (promotion.toUpperCase()) {
-                        case "R": newPiece = new Rook(currentTurn); break;
-                        case "B": newPiece = new Bishop(currentTurn); break;
-                        case "N": newPiece = new Knight(currentTurn); break;
-                        case "Q":
-                        default: newPiece = new Queen(currentTurn); break;
-                    }
-                    newPiece.setHasMoved(true);
-                    endBox.setPiece(newPiece);
+                // Default to Queen if no promotion choice was provided
+                String promoChoice = (promotion != null && !promotion.isEmpty()) ? promotion.toUpperCase() : "Q";
+                Piece newPiece;
+                switch (promoChoice) {
+                    case "R": newPiece = new Rook(currentTurn); break;
+                    case "B": newPiece = new Bishop(currentTurn); break;
+                    case "N": newPiece = new Knight(currentTurn); break;
+                    case "Q":
+                    default:  newPiece = new Queen(currentTurn); break;
                 }
-            }
-        }
-
-        Color enemyColor = (currentTurn == Color.WHITE) ? Color.BLACK : Color.WHITE;
-        String resultMessage = "";
-
-        // THREEFOLD REPETITION TRACKER (Take a snapshot AFTER the move is made)
-        String currentState = getBoardStateString();
-        positionHistory.put(currentState, positionHistory.getOrDefault(currentState, 0) + 1);
-        boolean isThreefold = positionHistory.get(currentState) >= 3;
-
-        // --- WIN / DRAW CHECKS ---
-        if (isKingInCheck(enemyColor)) {
-            if (isCheckmate(enemyColor)) {
-                resultMessage = "CHECKMATE! " + currentTurn + " wins!";
-            } else {
-                resultMessage = "CHECK! " + enemyColor + "'s King is under attack!";
-            }
-        } else {
-            // Check all 4 Draw Conditions!
-            if (isStalemate(enemyColor)) {
-                resultMessage = "DRAW! Game ended in Stalemate.";
-            } else if (isInsufficientMaterial()) {
-                resultMessage = "DRAW! Insufficient Material.";
-            } else if (halfMoveClock >= 100) {
-                resultMessage = "DRAW! 50-Move Rule.";
-            } else if (isThreefold) {
-                resultMessage = "DRAW! Threefold Repetition.";
-            } else {
-                resultMessage = enemyColor + "'s Turn";
+                newPiece.setHasMoved(true);
+                endBox.setPiece(newPiece);
             }
         }
 
@@ -289,10 +302,10 @@ public class Game {
 
             rookEndBox.setPiece(rook);
             rookStartBox.setPiece(null);
-            rook.setHasMoved(true);
+            if (rook != null) rook.setHasMoved(true);
         }
 
-        // Set the En Passant Target
+        // Set the En Passant Target for next turn
         board.setEnPassantTarget(null);
         if (pieceToMove instanceof Pawn && Math.abs(startX - endX) == 2) {
             int targetX = (startX + endX) / 2;
@@ -300,9 +313,62 @@ public class Game {
         }
 
         pieceToMove.setHasMoved(true);
+
+        Color enemyColor = (currentTurn == Color.WHITE) ? Color.BLACK : Color.WHITE;
         currentTurn = enemyColor;
 
+        // Threefold Repetition snapshot (taken AFTER move and turn switch)
+        String currentState = getBoardStateString();
+        positionHistory.put(currentState, positionHistory.getOrDefault(currentState, 0) + 1);
+        boolean isThreefold = positionHistory.get(currentState) >= 3;
+
+        // --- WIN / DRAW CHECKS ---
+        String resultMessage;
+        if (isKingInCheck(enemyColor)) {
+            if (isCheckmate(enemyColor)) {
+                // enemyColor is the one in checkmate; the winner is the opposite (the one who just moved)
+                resultMessage = "CHECKMATE! " + (enemyColor == Color.WHITE ? "BLACK" : "WHITE") + " wins!";
+                endMatch();
+            } else {
+                resultMessage = "CHECK! " + enemyColor + "'s King is under attack!";
+            }
+        } else {
+            if (isStalemate(enemyColor)) {
+                resultMessage = "DRAW! Game ended in Stalemate.";
+                endMatch();
+            } else if (isInsufficientMaterial()) {
+                resultMessage = "DRAW! Insufficient Material.";
+                endMatch();
+            } else if (halfMoveClock >= 100) {
+                resultMessage = "DRAW! 50-Move Rule.";
+                endMatch();
+            } else if (isThreefold) {
+                resultMessage = "DRAW! Threefold Repetition.";
+                endMatch();
+            } else {
+                resultMessage = enemyColor + "'s Turn";
+            }
+        }
+
         return resultMessage;
+    }
+
+    // ==========================================
+    // HELPER: Is a given Spot attacked by any piece of attackerColor?
+    // Used for castling transit-square validation.
+    // ==========================================
+    public boolean isSquareAttackedBy(Spot target, Color attackerColor) {
+        for (int i = 0; i < 8; i++) {
+            for (int j = 0; j < 8; j++) {
+                Piece p = board.getBox(i, j).getPiece();
+                if (p != null && p.getColor() == attackerColor) {
+                    if (p.canMove(board, board.getBox(i, j), target)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     public boolean isKingInCheck(Color kingColor) {
@@ -312,120 +378,80 @@ public class Game {
         for (int i = 0; i < 8; i++) {
             for (int j = 0; j < 8; j++) {
                 Piece p = board.getBox(i, j).getPiece();
-                if (p != null && p instanceof King && p.getColor() == kingColor) {
+                if (p instanceof King && p.getColor() == kingColor) {
                     kingSpot = board.getBox(i, j);
                     break;
                 }
             }
+            if (kingSpot != null) break;
         }
 
-        // If for some reason the King is missing (should never happen), return false
         if (kingSpot == null) return false;
 
-        // Step 2: Check if any enemy piece can attack that spot
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 8; j++) {
-                Piece p = board.getBox(i, j).getPiece();
-                // If there is an enemy piece on this square...
-                if (p != null && p.getColor() != kingColor) {
-                    // ...can it legally move to the King's spot?
-                    if (p.canMove(board, board.getBox(i, j), kingSpot)) {
-                        return true; // The King is in check!
-                    }
-                }
-            }
-        }
-
-        return false; // The King is safe
+        // Step 2: Check if any enemy piece can attack the King's spot
+        Color enemyColor = (kingColor == Color.WHITE) ? Color.BLACK : Color.WHITE;
+        return isSquareAttackedBy(kingSpot, enemyColor);
     }
 
     public boolean isCheckmate(Color color) {
-        // You cannot be checkmated if you aren't in check!
         if (!isKingInCheck(color)) {
             return false;
         }
-
-        // Loop through every square to find all of YOUR pieces
-        for (int startX = 0; startX < 8; startX++) {
-            for (int startY = 0; startY < 8; startY++) {
-                Spot startBox = board.getBox(startX, startY);
-                Piece piece = startBox.getPiece();
-
-                if (piece != null && piece.getColor() == color) {
-                    // We found one of your pieces! Now, try moving it to EVERY square on the board
-                    for (int endX = 0; endX < 8; endX++) {
-                        for (int endY = 0; endY < 8; endY++) {
-                            Spot endBox = board.getBox(endX, endY);
-
-                            // If the piece can mathematically move there...
-                            if (piece.canMove(board, startBox, endBox)) {
-
-                                // SIMULATE THE MOVE
-                                Piece destPiece = endBox.getPiece();
-                                endBox.setPiece(piece);
-                                startBox.setPiece(null);
-
-                                // Check if this move saved the King
-                                boolean stillInCheck = isKingInCheck(color);
-
-                                // UNDO THE SIMULATION
-                                startBox.setPiece(piece);
-                                endBox.setPiece(destPiece);
-
-                                // If the King is no longer in check, there is an escape! Not checkmate.
-                                if (!stillInCheck) {
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // If we tried every move and none saved the King... game over.
-        return true;
+        return !hasAnyLegalMove(color);
     }
-    // NEW: Allows the server to explicitly check for a timeout without needing a move
+
+    // Allows the server to explicitly check for a timeout without needing a move
     public String checkTimeout() {
+        if (!matchStarted) return "SAFE";
+
         long currentTime = System.currentTimeMillis();
         long elapsed = currentTime - lastMoveTimestamp;
 
         if (currentTurn == Color.WHITE) {
-            if (whiteTimeRemaining - elapsed <= 0) return "TIME_OUT! Black wins on time!";
+            if (whiteTimeRemaining - elapsed <= 0) {
+                whiteTimeRemaining = 0;
+                endMatch();
+                return "TIME_OUT! Black wins on time!";
+            }
         } else {
-            if (blackTimeRemaining - elapsed <= 0) return "TIME_OUT! White wins on time!";
+            if (blackTimeRemaining - elapsed <= 0) {
+                blackTimeRemaining = 0;
+                endMatch();
+                return "TIME_OUT! White wins on time!";
+            }
         }
-
-        return "SAFE"; // Not timed out yet
+        return "SAFE";
     }
-    // NEW: Returns a list of valid [x, y] coordinates for a given piece
+
+    // Returns a list of valid [x, y] coordinates for a given piece
     public List<int[]> getValidMoves(int startX, int startY) {
         List<int[]> validMoves = new ArrayList<>();
         Spot startBox = board.getBox(startX, startY);
         Piece piece = startBox.getPiece();
 
-        // FIX: Removed the "currentTurn" check so the engine can simulate future turns!
         if (piece == null) {
             return validMoves;
         }
 
-        // Test moving this piece to every single square on the board
         for (int endX = 0; endX < 8; endX++) {
             for (int endY = 0; endY < 8; endY++) {
                 Spot endBox = board.getBox(endX, endY);
 
-                // 1. Does the math allow it?
                 if (piece.canMove(board, startBox, endBox)) {
 
-                    // (Prevent illegal castling predictions)
-                    if (piece instanceof King && Math.abs(startY - endY) == 2 && isKingInCheck(piece.getColor())) {
-                        continue;
+                    // Skip castling if in check or if the transit square is attacked
+                    if (piece instanceof King && Math.abs(startY - endY) == 2) {
+                        if (isKingInCheck(piece.getColor())) continue;
+                        int direction = (endY > startY) ? 1 : -1;
+                        Spot transitSpot = board.getBox(startX, startY + direction);
+                        Color enemyColor = (piece.getColor() == Color.WHITE) ? Color.BLACK : Color.WHITE;
+                        if (isSquareAttackedBy(transitSpot, enemyColor)) continue;
                     }
 
-                    // 2. SIMULATION: Make the move temporarily
+                    // SIMULATION: temporarily make the move
                     Piece destPiece = endBox.getPiece();
 
-                    // Temporarily remove En Passant victim during simulation
+                    // Handle EP victim removal during simulation
                     Piece epVictim = null;
                     Spot epVictimSpot = null;
                     if (piece instanceof Pawn && startX != endX && startY != endY && destPiece == null) {
@@ -437,17 +463,15 @@ public class Game {
                     endBox.setPiece(piece);
                     startBox.setPiece(null);
 
-                    // Does it leave the King safe? (Check for THIS piece's color)
                     boolean isSafe = !isKingInCheck(piece.getColor());
 
                     // UNDO SIMULATION
                     startBox.setPiece(piece);
                     endBox.setPiece(destPiece);
                     if (epVictimSpot != null) {
-                        epVictimSpot.setPiece(epVictim); // Put the victim back
+                        epVictimSpot.setPiece(epVictim);
                     }
 
-                    // If it is completely legal and safe, add it to the list!
                     if (isSafe) {
                         validMoves.add(new int[]{endX, endY});
                     }
@@ -458,28 +482,64 @@ public class Game {
     }
 
     public boolean isStalemate(Color color) {
-        // You cannot be in stalemate if you are in check!
         if (isKingInCheck(color)) {
             return false;
         }
+        return !hasAnyLegalMove(color);
+    }
 
-        // Loop through the whole board to find this player's pieces
-        for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-                Piece p = board.getBox(r, c).getPiece();
-                if (p != null && p.getColor() == color) {
-                    // If even ONE piece has at least ONE valid move, it is NOT a stalemate
-                    if (!getValidMoves(r, c).isEmpty()) {
-                        return false;
+    // Shared helper: does `color` have at least one legal move?
+    // Used by isCheckmate() and isStalemate() to avoid code duplication.
+    private boolean hasAnyLegalMove(Color color) {
+        for (int startX = 0; startX < 8; startX++) {
+            for (int startY = 0; startY < 8; startY++) {
+                Spot startBox = board.getBox(startX, startY);
+                Piece piece = startBox.getPiece();
+
+                if (piece == null || piece.getColor() != color) continue;
+
+                for (int endX = 0; endX < 8; endX++) {
+                    for (int endY = 0; endY < 8; endY++) {
+                        Spot endBox = board.getBox(endX, endY);
+
+                        if (!piece.canMove(board, startBox, endBox)) continue;
+
+                        // SIMULATE THE MOVE
+                        Piece destPiece = endBox.getPiece();
+
+                        // EP victim removal
+                        Piece epVictim = null;
+                        Spot epVictimSpot = null;
+                        if (piece instanceof Pawn && startX != endX && startY != endY && destPiece == null) {
+                            epVictimSpot = board.getBox(startX, endY);
+                            epVictim = epVictimSpot.getPiece();
+                            epVictimSpot.setPiece(null);
+                        }
+
+                        endBox.setPiece(piece);
+                        startBox.setPiece(null);
+
+                        boolean stillInCheck = isKingInCheck(color);
+
+                        // UNDO
+                        startBox.setPiece(piece);
+                        endBox.setPiece(destPiece);
+                        if (epVictimSpot != null) {
+                            epVictimSpot.setPiece(epVictim);
+                        }
+
+                        if (!stillInCheck) {
+                            return true; // At least one legal move exists
+                        }
                     }
                 }
             }
         }
-        // If we checked every piece and no valid moves exist... it's a draw!
-        return true;
+        return false;
     }
 
-    // Converts the board into a simple string of letters (e.g., "wK-bR---...") to easily compare history
+    // Converts the board to a canonical string for threefold repetition tracking.
+    // Uses 'N' explicitly for Knight to avoid collision with King ('K').
     private String getBoardStateString() {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 8; i++) {
@@ -488,18 +548,25 @@ public class Game {
                 if (p == null) {
                     sb.append("-");
                 } else {
-                    sb.append(p.getColor() == Color.WHITE ? "w" : "b").append(p.getClass().getSimpleName().charAt(0));
+                    char colorChar = (p.getColor() == Color.WHITE) ? 'w' : 'b';
+                    char typeChar;
+                    if (p instanceof Knight) {
+                        typeChar = 'N'; // Explicitly 'N' to avoid collision with King 'K'
+                    } else {
+                        typeChar = p.getClass().getSimpleName().charAt(0);
+                    }
+                    sb.append(colorChar).append(typeChar);
                 }
             }
         }
-        sb.append(currentTurn); // Whose turn it is matters for repetition!
+        sb.append(currentTurn); // Whose turn matters for repetition
         return sb.toString();
     }
 
-    // Checks if a checkmate is mathematically impossible
+    // Checks if checkmate is mathematically impossible (insufficient material)
     private boolean isInsufficientMaterial() {
         int whiteMinors = 0, blackMinors = 0;
-        int majorPieces = 0; // Queens, Rooks, Pawns
+        int majorPieces = 0;
 
         for (int i = 0; i < 8; i++) {
             for (int j = 0; j < 8; j++) {
@@ -515,13 +582,12 @@ public class Game {
             }
         }
 
-        // If there are Queens, Rooks, or Pawns, checkmate is still possible
         if (majorPieces > 0) return false;
 
-        // King vs King (0 minor pieces) -> Draw
+        // King vs King
         if (whiteMinors == 0 && blackMinors == 0) return true;
 
-        // King + 1 Minor Piece vs King -> Draw
+        // King + 1 minor vs King
         if ((whiteMinors == 1 && blackMinors == 0) || (blackMinors == 1 && whiteMinors == 0)) return true;
 
         return false;

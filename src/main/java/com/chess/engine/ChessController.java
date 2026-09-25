@@ -1,6 +1,5 @@
 package com.chess.engine;
 
-import jakarta.servlet.http.HttpSession;
 import java.util.List;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -10,16 +9,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.messaging.handler.annotation.MessageMapping;
 import org.springframework.messaging.handler.annotation.Payload;
 
 
-@RestController // Tells Spring Boot: "This class is a Waiter that listens to the internet"
-@CrossOrigin    // A security bypass that allows our future HTML website to talk to this server
+@RestController
+@CrossOrigin
 public class ChessController {
 
     @Autowired
@@ -30,31 +26,28 @@ public class ChessController {
 
     private Game game = new Game();
 
-    // NEW: The matchmaking bucket
-    private List<String> unassignedColors;
-
-    public ChessController() {
-        // When the server starts, fill the bucket and shuffle it!
-        unassignedColors = new ArrayList<>(Arrays.asList("WHITE", "BLACK"));
-        Collections.shuffle(unassignedColors);
+    // ==========================================
+    // PUBLIC ACCESSOR: used by WebSocketEventListener
+    // to decide whether to start an abandon timer
+    // ==========================================
+    public boolean isMatchActive() {
+        return game.isMatchStarted();
     }
 
     // ==========================================
     // THE RECONNECT FIX: Link STOMP Sessions to Players
-    // =========================================
+    // ==========================================
     @MessageMapping("/register")
     public void registerSession(@Payload String color, @Header("simpSessionId") String sessionId) {
-        // STOMP sometimes sends strings with literal quotes like ""WHITE"". This cleans it up!
+        // STOMP sometimes wraps strings with literal quotes. This cleans it up.
         String cleanColor = color.replace("\"", "").trim();
-
-        // Add a print statement so we can visibly PROVE the handshake worked
         System.out.println("🔗 HANDSHAKE SUCCESS: " + cleanColor + " registered to session " + sessionId);
 
         webSocketEventListener.registerPlayerSession(sessionId, cleanColor);
         disarmGhostTimer(cleanColor);
     }
-    // NEW: Endpoint for players to claim an identity when they open the link
-    // We completely removed HttpSession!
+
+    // Endpoint for players to claim an identity when they open the link
     @GetMapping("/join")
     public String join(@RequestParam(required = false) String token) {
         return game.assignPlayer(token);
@@ -67,36 +60,38 @@ public class ChessController {
         state.put("whiteTime", game.getWhiteTimeRemaining());
         state.put("blackTime", game.getBlackTimeRemaining());
         state.put("moveHistory", game.getMoveHistory());
-
-        // NEW: Tell the browser if the match is actively running!
         state.put("matchStarted", game.isMatchStarted());
+        // Tell the client whose turn it is so the correct clock ticks
+        state.put("currentTurn", game.getCurrentTurn().toString());
         return state;
     }
 
-    // NEW: Endpoint for the Ready Button
+    // Endpoint for the Ready Button
     @GetMapping("/ready")
     public String playerReady(@RequestParam String color) {
         boolean isStarting = game.setPlayerReady(color);
 
-        // ONLY broadcast if the match is officially starting!
         if (isStarting) {
             Map<String, Object> payload = new HashMap<>();
             payload.put("type", "START");
+            // Include whose turn it is so clients can initialize the correct clock
+            payload.put("currentTurn", game.getCurrentTurn().toString());
             messagingTemplate.convertAndSend("/topic/game", (Object) payload);
         }
 
         return "OK";
     }
 
-    // NEW: Endpoint for Resign / Abort
+    // Endpoint for Resign / Abort
     @GetMapping("/action")
     public String playerAction(@RequestParam String action, @RequestParam String color) {
         disarmGhostTimer(color);
 
+        // game.resign() / game.abort() both call endMatch() internally
         String status = "RESIGN".equals(action) ? game.resign(color) : game.abort();
 
         Map<String, Object> payload = new HashMap<>();
-        payload.put("type", "MOVE"); // We pretend it's a move so JS handles it naturally
+        payload.put("type", "MOVE");
         payload.put("status", status);
         payload.put("grid", getBoardState());
         payload.put("pieceCode", "");
@@ -105,67 +100,58 @@ public class ChessController {
         payload.put("whiteTime", game.getWhiteTimeRemaining());
         payload.put("blackTime", game.getBlackTimeRemaining());
 
-        // Save the game-ending action to memory
         game.addMoveToHistory(payload);
-
         messagingTemplate.convertAndSend("/topic/game", (Object) payload);
         return status;
     }
 
-    // This creates a link: http://localhost:8080/validMoves?startX=...&startY=...
     @GetMapping("/validMoves")
     public List<int[]> getValidMoves(@RequestParam int startX, @RequestParam int startY) {
-        // Returns a JSON array of coordinates, like: [[2, 4], [3, 4]]
         return game.getValidMoves(startX, startY);
     }
 
-    // This creates a web link: http://localhost:8080/move
     @GetMapping("/move")
     public String movePiece(@RequestParam int startX, @RequestParam int startY,
                             @RequestParam int endX, @RequestParam int endY,
                             @RequestParam(required = false) String promotion,
-                            @RequestParam String pieceCode) { // NEW: Ask JS what piece moved
+                            @RequestParam String pieceCode) {
 
+        // Disarm the ghost bomb so making a move counts as being active
         if (pieceCode != null && !pieceCode.isEmpty()) {
             String activeColor = pieceCode.startsWith("w") ? "WHITE" : "BLACK";
-            disarmGhostTimer(activeColor); // Disarm the ghost bomb!
+            disarmGhostTimer(activeColor);
         }
 
+        // game.playerMove() now guards against !matchStarted internally
         String status = game.playerMove(startX, startY, endX, endY, promotion);
 
         if (!status.contains("ERROR")) {
-            // MOVE WAS SUCCESSFUL! Build a massive data packet to shout to all players.
             Map<String, Object> payload = new HashMap<>();
             payload.put("type", "MOVE");
             payload.put("status", status);
-            payload.put("grid", getBoardState()); // Broadcast the new grid directly!
+            payload.put("grid", getBoardState());
             payload.put("pieceCode", pieceCode);
             payload.put("startX", startX);
             payload.put("startY", startY);
             payload.put("endX", endX);
             payload.put("endY", endY);
             payload.put("promotion", promotion);
-            // NEW: Add the official server time to the broadcast
             payload.put("whiteTime", game.getWhiteTimeRemaining());
             payload.put("blackTime", game.getBlackTimeRemaining());
+            // Tell clients whose turn it is now so the correct clock starts ticking
+            payload.put("currentTurn", game.getCurrentTurn().toString());
 
-            // Save the payload to the server's memory bank!
             game.addMoveToHistory(payload);
-            // Blast it to the "/topic/game" radio channel
-
             messagingTemplate.convertAndSend("/topic/game", (Object) payload);
         }
 
         return status;
     }
 
-    // A handy link to restart the game: http://localhost:8080/reset
     @GetMapping("/reset")
     public String reset() {
-        // 1. Trigger the master reset switch in Game.java
         game.resetGame();
 
-        // 2. Broadcast the reset command to all connected browsers
         Map<String, String> payload = new HashMap<>();
         payload.put("type", "RESET");
         messagingTemplate.convertAndSend("/topic/game", payload);
@@ -173,16 +159,12 @@ public class ChessController {
         return "Reset successful";
     }
 
-    // --- NEW: Arcade Cabinet Reset ---
+    // Arcade Cabinet Reset — wipes seats and board, kicks everyone to refresh
     @GetMapping("/leave")
     public String leaveTable() {
-        // 1. Wipe the secret tokens
         game.clearSeats();
-
-        // 2. Wipe the board and clocks
         game.resetGame();
 
-        // 3. Tell EVERY connected browser to forcefully refresh!
         Map<String, String> payload = new HashMap<>();
         payload.put("type", "KICK");
         messagingTemplate.convertAndSend("/topic/game", payload);
@@ -191,23 +173,22 @@ public class ChessController {
     }
 
     // ==========================================
-    // THE ABANDONMENT FIX: Award the win to the remaining player
+    // ABANDONMENT: Award win to remaining player
     // ==========================================
     public void handleAbandonment(String droppedColor) {
         if (!game.isMatchStarted()) {
             System.out.println("Match is already over. Ignoring abandonment for " + droppedColor);
             return;
         }
-        // 1. Force the backend game engine to officially end the match
+
+        // Force the backend to officially end the match
         game.resign(droppedColor);
 
-        // 2. Determine the winner
         String winner = droppedColor.equals("WHITE") ? "Black" : "White";
         String status = droppedColor + " ABANDONED. " + winner + " wins!";
 
-        // 3. Build a "Game Over" payload that the frontend already knows how to read!
         Map<String, Object> payload = new HashMap<>();
-        payload.put("type", "MOVE"); // Pretend it's a move so the JS overlay triggers naturally
+        payload.put("type", "MOVE");
         payload.put("status", status);
         payload.put("grid", getBoardState());
         payload.put("pieceCode", "");
@@ -216,15 +197,13 @@ public class ChessController {
         payload.put("whiteTime", game.getWhiteTimeRemaining());
         payload.put("blackTime", game.getBlackTimeRemaining());
 
-        // Save it to history and broadcast it
         game.addMoveToHistory(payload);
         messagingTemplate.convertAndSend("/topic/game", (Object) payload);
     }
 
-    // This creates a web link: http://localhost:8080/board
+    // Board state snapshot helper
     @GetMapping("/board")
     public String[][] getBoardState() {
-        // We will create a simple 8x8 grid of text to send to the website
         String[][] grid = new String[8][8];
 
         for (int i = 0; i < 8; i++) {
@@ -232,23 +211,21 @@ public class ChessController {
                 Piece p = game.getBoard().getBox(i, j).getPiece();
 
                 if (p == null) {
-                    grid[i][j] = ""; // Empty square
+                    grid[i][j] = "";
                 } else {
                     String color = p.getColor() == Color.WHITE ? "w" : "b";
-                    String type = "";
+                    String type;
 
                     switch (p) {
-                        case King king -> type = "K";
-                        case Queen queen -> type = "Q";
-                        case Rook rook -> type = "R";
+                        case King king     -> type = "K";
+                        case Queen queen   -> type = "Q";
+                        case Rook rook     -> type = "R";
                         case Bishop bishop -> type = "B";
                         case Knight knight -> type = "N";
-                        case Pawn pawn -> type = "P";
-                        default -> {
-                        }
+                        case Pawn pawn     -> type = "P";
+                        default            -> type = "";
                     }
 
-                    // Example: White Knight becomes "wN", Black King becomes "bK"
                     grid[i][j] = color + type;
                 }
             }
@@ -256,7 +233,7 @@ public class ChessController {
         return grid;
     }
 
-    // NEW: Endpoint for the frontend to trigger a timeout check
+    // Endpoint for the frontend to trigger a timeout check
     @GetMapping("/timeout")
     public String triggerTimeout() {
         String status = game.checkTimeout();
@@ -265,28 +242,28 @@ public class ChessController {
             Map<String, Object> payload = new HashMap<>();
             payload.put("type", "MOVE");
             payload.put("status", status);
-
-            // THE FIX: Use getBoard() instead of game.getBoard()
             payload.put("grid", getBoardState());
-
             payload.put("pieceCode", "");
             payload.put("startX", 0); payload.put("startY", 0);
             payload.put("endX", 0); payload.put("endY", 0);
-            payload.put("whiteTime", game.getWhiteTimeRemaining()); // Make sure to send the 0 time!
+            payload.put("whiteTime", game.getWhiteTimeRemaining());
             payload.put("blackTime", game.getBlackTimeRemaining());
 
+            game.addMoveToHistory(payload);
             messagingTemplate.convertAndSend("/topic/game", (Object) payload);
         }
 
         return status;
     }
+
     // ==========================================
-    // THE GHOST BOMB DISARMER
+    // GHOST BOMB DISARMER
     // ==========================================
     private void disarmGhostTimer(String color) {
         if (color == null) return;
 
-        java.util.concurrent.ScheduledFuture<?> activeTimer = WebSocketEventListener.disconnectTimers.remove(color.toUpperCase());
+        java.util.concurrent.ScheduledFuture<?> activeTimer =
+                WebSocketEventListener.disconnectTimers.remove(color.toUpperCase());
 
         if (activeTimer != null) {
             activeTimer.cancel(true);
@@ -294,7 +271,7 @@ public class ChessController {
 
             Map<String, String> reconnectPayload = new HashMap<>();
             reconnectPayload.put("type", "RECONNECT_SUCCESS");
-            reconnectPayload.put("color", color);
+            reconnectPayload.put("color", color.toUpperCase());
             messagingTemplate.convertAndSend("/topic/game", (Object) reconnectPayload);
         }
     }
@@ -304,10 +281,9 @@ public class ChessController {
     // ==========================================
     @MessageMapping("/chat")
     public void handleChat(Map<String, String> payload) {
-        // Disarm the ghost timer so chatting counts as being "active"
+        // Disarm ghost timer — chatting counts as being active
         disarmGhostTimer(payload.get("sender"));
 
-        // Tag it as a chat message and broadcast it to both players
         payload.put("type", "CHAT");
         messagingTemplate.convertAndSend("/topic/game", (Object) payload);
     }
