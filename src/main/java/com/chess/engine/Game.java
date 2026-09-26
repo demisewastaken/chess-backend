@@ -129,6 +129,7 @@ public class Game {
     public void resetGame() {
         this.board = new Board();
         this.currentTurn = Color.WHITE;
+        this.moveHistory.clear(); // Clear move history so fetchBoard() doesn't rebuild from stale data
 
         // Reset Lobby & Match State
         this.whiteReady = false;
