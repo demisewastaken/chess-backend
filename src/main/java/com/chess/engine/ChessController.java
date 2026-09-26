@@ -60,6 +60,7 @@ public class ChessController {
         state.put("whiteTime", game.getWhiteTimeRemaining());
         state.put("blackTime", game.getBlackTimeRemaining());
         state.put("moveHistory", game.getMoveHistory());
+        state.put("chatHistory", game.getChatHistory());
         state.put("matchStarted", game.isMatchStarted());
         // Tell the client whose turn it is so the correct clock ticks
         state.put("currentTurn", game.getCurrentTurn().toString());
@@ -285,6 +286,9 @@ public class ChessController {
         disarmGhostTimer(payload.get("sender"));
 
         payload.put("type", "CHAT");
+        // Persist chat message to game history
+        Map<String, Object> chatRecord = new HashMap<>(payload);
+        game.addChatToHistory(chatRecord);
         messagingTemplate.convertAndSend("/topic/game", (Object) payload);
     }
 }

@@ -6,6 +6,7 @@ import java.util.Map;
 public class Game {
     // The Server-Side Memory Bank
     private List<Map<String, Object>> moveHistory = new ArrayList<>();
+    private List<Map<String, Object>> chatHistory = new ArrayList<>();
     private Board board;
     private Color currentTurn;
 
@@ -84,6 +85,14 @@ public class Game {
         moveHistory.add(movePayload);
     }
 
+    public List<Map<String, Object>> getChatHistory() {
+        return chatHistory;
+    }
+
+    public void addChatToHistory(Map<String, Object> chatPayload) {
+        chatHistory.add(chatPayload);
+    }
+
     // DRAW TRACKERS
     // Counts half-moves. Resets to 0 on pawn move or capture. At 100 = 50-Move Draw.
     private int halfMoveClock = 0;
@@ -147,6 +156,7 @@ public class Game {
 
         // Wipe the Server Memory Bank
         this.moveHistory.clear();
+        this.chatHistory.clear();
     }
 
     // LEAVE TABLE METHOD
