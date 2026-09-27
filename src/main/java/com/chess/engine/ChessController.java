@@ -64,23 +64,46 @@ public class ChessController {
         state.put("matchStarted", game.isMatchStarted());
         // Tell the client whose turn it is so the correct clock ticks
         state.put("currentTurn", game.getCurrentTurn().toString());
+        // Per-player state for post-game rematch/new-game flow
+        state.put("whiteWantsRematch", game.getWhiteWantsRematch());
+        state.put("blackWantsRematch", game.getBlackWantsRematch());
+        state.put("whiteReady", game.isWhiteReady());
+        state.put("blackReady", game.isBlackReady());
         return state;
     }
 
     // Endpoint for the Ready Button
     @GetMapping("/ready")
     public String playerReady(@RequestParam String color) {
+        // If match has ended, use the rematch opt-in mechanism
+        if (!game.isMatchStarted()) {
+            Map<String, Object> result = game.requestRematch(color);
+            if ((Boolean) result.get("matchStarted")) {
+                broadcastStart();
+            }
+            // DO NOT broadcast REMATCH_STATE globally - it incorrectly forces opponent into Waiting
+            return "OK";
+        }
+
+        // Normal pre-game ready behavior
         boolean isStarting = game.setPlayerReady(color);
 
         if (isStarting) {
-            Map<String, Object> payload = new HashMap<>();
-            payload.put("type", "START");
-            // Include whose turn it is so clients can initialize the correct clock
-            payload.put("currentTurn", game.getCurrentTurn().toString());
-            messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+            broadcastStart();
         }
 
         return "OK";
+    }
+
+    // Endpoint for player-specific Rematch/New-Game opt-in
+    @GetMapping("/rematch")
+    public Map<String, Object> playerRematch(@RequestParam String color) {
+        Map<String, Object> result = game.requestRematch(color);
+        if ((Boolean) result.get("matchStarted")) {
+            broadcastStart();
+        }
+        // DO NOT broadcast REMATCH_STATE globally - it incorrectly forces opponent into Waiting
+        return result;
     }
 
     // Endpoint for Resign / Abort
@@ -275,6 +298,29 @@ public class ChessController {
             reconnectPayload.put("color", color.toUpperCase());
             messagingTemplate.convertAndSend("/topic/game", (Object) reconnectPayload);
         }
+    }
+
+    // Helper: broadcast START message
+    private void broadcastStart() {
+        System.out.println("DEBUG: broadcastStart called");
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "START");
+        payload.put("currentTurn", game.getCurrentTurn().toString());
+        payload.put("grid", game.getBoard());
+        payload.put("whiteTime", game.getWhiteTimeRemaining());
+        payload.put("blackTime", game.getBlackTimeRemaining());
+        payload.put("moveHistory", game.getMoveHistory());
+        payload.put("matchStarted", true);
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+    }
+
+    // Helper: broadcast rematch state update
+    private void broadcastRematchState() {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "REMATCH_STATE");
+        payload.put("whiteWantsRematch", game.getWhiteWantsRematch());
+        payload.put("blackWantsRematch", game.getBlackWantsRematch());
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
     }
 
     // ==========================================

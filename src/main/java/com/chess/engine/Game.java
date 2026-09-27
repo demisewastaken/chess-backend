@@ -1,5 +1,6 @@
 package com.chess.engine;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -14,8 +15,12 @@ public class Game {
     private String whiteToken = null;
     private String blackToken = null;
 
+    // Lock for synchronizing critical state transitions
+    private final Object stateLock = new Object();
+
     public String assignPlayer(String returningToken) {
-        // 1. Welcome back returning players
+        synchronized (stateLock) {
+            // 1. Welcome back returning players
         if (returningToken != null && !returningToken.isEmpty()) {
             if (returningToken.equals(whiteToken)) return whiteToken;
             if (returningToken.equals(blackToken)) return blackToken;
@@ -32,11 +37,36 @@ public class Game {
         }
 
         return "SPECTATOR";
+        }
     }
 
     // Allows the Controller to ask if the match is running
     public boolean isMatchStarted() {
-        return matchStarted;
+        synchronized (stateLock) {
+            return matchStarted;
+        }
+    }
+
+    // Per-player readiness/rematch state accessors
+    public boolean isWhiteReady() {
+        synchronized (stateLock) {
+            return whiteReady;
+        }
+    }
+    public boolean isBlackReady() {
+        synchronized (stateLock) {
+            return blackReady;
+        }
+    }
+    public boolean getWhiteWantsRematch() {
+        synchronized (stateLock) {
+            return whiteWantsRematch;
+        }
+    }
+    public boolean getBlackWantsRematch() {
+        synchronized (stateLock) {
+            return blackWantsRematch;
+        }
     }
 
     // LOBBY TRACKERS
@@ -44,26 +74,81 @@ public class Game {
     private boolean blackReady = false;
     private boolean matchStarted = false;
 
+    // PER-PLAYER REMATCH/NEW-GAME OPT-IN STATE
+    private boolean whiteWantsRematch = false;
+    private boolean blackWantsRematch = false;
+
+    // Call this when a player clicks "Ready" or requests a rematch after game end
+    // Returns true if both players have opted in and a new match should start
+    public Map<String, Object> requestRematch(String color) {
+        synchronized (stateLock) {
+            Map<String, Object> result = new HashMap<>();
+
+            if ("WHITE".equals(color)) {
+                whiteWantsRematch = true;
+            } else if ("BLACK".equals(color)) {
+                blackWantsRematch = true;
+            }
+
+            result.put("whiteWantsRematch", whiteWantsRematch);
+            result.put("blackWantsRematch", blackWantsRematch);
+
+            // If both players have opted in, start a new match
+            if (whiteWantsRematch && blackWantsRematch) {
+                // Reset the shared game state for a fresh match
+                resetBoardForNewMatchInternal();
+                matchStarted = true;
+                lastMoveTimestamp = System.currentTimeMillis();
+
+                // Clear rematch flags
+                whiteWantsRematch = false;
+                blackWantsRematch = false;
+
+                // Also reset ready flags since we're starting fresh
+                whiteReady = false;
+                blackReady = false;
+
+                result.put("matchStarted", true);
+            } else {
+                result.put("matchStarted", false);
+            }
+
+            return result;
+        }
+    }
+
     // Call this when a player clicks "Ready"
     public boolean setPlayerReady(String color) {
-        if ("WHITE".equals(color)) whiteReady = true;
-        if ("BLACK".equals(color)) blackReady = true;
+        synchronized (stateLock) {
+            if ("WHITE".equals(color)) whiteReady = true;
+            if ("BLACK".equals(color)) blackReady = true;
 
-        if (whiteReady && blackReady) {
-            matchStarted = true;
-            lastMoveTimestamp = System.currentTimeMillis();
-            return true;
+            if (whiteReady && blackReady) {
+                matchStarted = true;
+                lastMoveTimestamp = System.currentTimeMillis();
+                // Reset board for fresh game (preserves readiness/seats)
+                resetBoardForNewMatchInternal();
+                return true;
+            }
+            return false;
         }
-        return false;
     }
 
     // Marks the game as officially over and freezes the clocks
     private void endMatch() {
-        matchStarted = false;
-        // Freeze the remaining time so subsequent /sync calls return stable values
-        whiteTimeRemaining = getWhiteTimeRemaining();
-        blackTimeRemaining = getBlackTimeRemaining();
-        lastMoveTimestamp = System.currentTimeMillis();
+        synchronized (stateLock) {
+            matchStarted = false;
+            // Reset readiness so a new match requires both players to explicitly agree
+            whiteReady = false;
+            blackReady = false;
+            // Reset rematch opt-in flags
+            whiteWantsRematch = false;
+            blackWantsRematch = false;
+            // Freeze the remaining time so subsequent /sync calls return stable values
+            whiteTimeRemaining = getWhiteTimeRemaining();
+            blackTimeRemaining = getBlackTimeRemaining();
+            lastMoveTimestamp = System.currentTimeMillis();
+        }
     }
 
     // Action Handlers for Resign and Abort
@@ -78,19 +163,27 @@ public class Game {
     }
 
     public List<Map<String, Object>> getMoveHistory() {
-        return moveHistory;
+        synchronized (stateLock) {
+            return new ArrayList<>(moveHistory);
+        }
     }
 
     public void addMoveToHistory(Map<String, Object> movePayload) {
-        moveHistory.add(movePayload);
+        synchronized (stateLock) {
+            moveHistory.add(movePayload);
+        }
     }
 
     public List<Map<String, Object>> getChatHistory() {
-        return chatHistory;
+        synchronized (stateLock) {
+            return new ArrayList<>(chatHistory);
+        }
     }
 
     public void addChatToHistory(Map<String, Object> chatPayload) {
-        chatHistory.add(chatPayload);
+        synchronized (stateLock) {
+            chatHistory.add(chatPayload);
+        }
     }
 
     // DRAW TRACKERS
@@ -107,19 +200,23 @@ public class Game {
 
     // LIVE TIME CALCULATION — returns frozen time when match is not active
     public long getWhiteTimeRemaining() {
-        if (matchStarted && currentTurn == Color.WHITE) {
-            long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
-            return Math.max(0, whiteTimeRemaining - elapsed);
+        synchronized (stateLock) {
+            if (matchStarted && currentTurn == Color.WHITE) {
+                long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
+                return Math.max(0, whiteTimeRemaining - elapsed);
+            }
+            return Math.max(0, whiteTimeRemaining);
         }
-        return Math.max(0, whiteTimeRemaining);
     }
 
     public long getBlackTimeRemaining() {
-        if (matchStarted && currentTurn == Color.BLACK) {
-            long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
-            return Math.max(0, blackTimeRemaining - elapsed);
+        synchronized (stateLock) {
+            if (matchStarted && currentTurn == Color.BLACK) {
+                long elapsed = System.currentTimeMillis() - lastMoveTimestamp;
+                return Math.max(0, blackTimeRemaining - elapsed);
+            }
+            return Math.max(0, blackTimeRemaining);
         }
-        return Math.max(0, blackTimeRemaining);
     }
 
     public Game() {
@@ -129,21 +226,51 @@ public class Game {
 
     // Returns whose turn it currently is (used by controller for clock sync)
     public Color getCurrentTurn() {
-        return currentTurn;
+        synchronized (stateLock) {
+            return currentTurn;
+        }
     }
 
     // ==========================================
     // MASTER RESET METHOD
     // ==========================================
     public void resetGame() {
+        synchronized (stateLock) {
+            this.board = new Board();
+            this.currentTurn = Color.WHITE;
+            this.moveHistory.clear(); // Clear move history so fetchBoard() doesn't rebuild from stale data
+
+            // Reset Lobby & Match State
+            this.whiteReady = false;
+            this.blackReady = false;
+            this.matchStarted = false;
+
+            // Reset Rematch Opt-In State
+            this.whiteWantsRematch = false;
+            this.blackWantsRematch = false;
+
+            // Reset Draw Trackers
+            this.halfMoveClock = 0;
+            this.positionHistory.clear();
+
+            // Reset Clocks
+            this.whiteTimeRemaining = 10 * 60 * 1000;
+            this.blackTimeRemaining = 10 * 60 * 1000;
+            this.lastMoveTimestamp = System.currentTimeMillis();
+
+            // Wipe the Server Memory Bank
+            this.moveHistory.clear();
+            this.chatHistory.clear();
+        }
+    }
+
+    // Reset board for a new match WITHOUT clearing player readiness/seats
+    // Called when both players click "I AM READY" to start a fresh game
+    // INTERNAL version - assumes caller holds stateLock
+    private void resetBoardForNewMatchInternal() {
         this.board = new Board();
         this.currentTurn = Color.WHITE;
-        this.moveHistory.clear(); // Clear move history so fetchBoard() doesn't rebuild from stale data
-
-        // Reset Lobby & Match State
-        this.whiteReady = false;
-        this.blackReady = false;
-        this.matchStarted = false;
+        this.moveHistory.clear();
 
         // Reset Draw Trackers
         this.halfMoveClock = 0;
@@ -154,9 +281,14 @@ public class Game {
         this.blackTimeRemaining = 10 * 60 * 1000;
         this.lastMoveTimestamp = System.currentTimeMillis();
 
-        // Wipe the Server Memory Bank
-        this.moveHistory.clear();
-        this.chatHistory.clear();
+        // Note: Preserves whiteReady, blackReady, matchStarted, whiteToken, blackToken, chatHistory
+    }
+
+    // Public synchronized version for /sync consistency
+    public void resetBoardForNewMatch() {
+        synchronized (stateLock) {
+            resetBoardForNewMatchInternal();
+        }
     }
 
     // LEAVE TABLE METHOD
@@ -166,7 +298,9 @@ public class Game {
     }
 
     public Board getBoard() {
-        return board;
+        synchronized (stateLock) {
+            return board;
+        }
     }
 
     // ==========================================
