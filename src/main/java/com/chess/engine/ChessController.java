@@ -57,6 +57,7 @@ public class ChessController {
     public Map<String, Object> syncGameState() {
         Map<String, Object> state = new HashMap<>();
         state.put("grid", getBoardState());
+        state.put("status", game.getCurrentStatus());
         state.put("whiteTime", game.getWhiteTimeRemaining());
         state.put("blackTime", game.getBlackTimeRemaining());
         state.put("moveHistory", game.getMoveHistory());
@@ -69,6 +70,8 @@ public class ChessController {
         state.put("blackWantsRematch", game.getBlackWantsRematch());
         state.put("whiteReady", game.isWhiteReady());
         state.put("blackReady", game.isBlackReady());
+        // Abort timer state for reconnection recovery
+        state.put("abortTimer", game.getAbortTimerState());
         return state;
     }
 
@@ -76,7 +79,7 @@ public class ChessController {
     @GetMapping("/ready")
     public String playerReady(@RequestParam String color) {
         // If match has ended, use the rematch opt-in mechanism
-        if (!game.isMatchStarted()) {
+        if (game.hasMatchEnded()) {
             Map<String, Object> result = game.requestRematch(color);
             if ((Boolean) result.get("matchStarted")) {
                 broadcastStart();
@@ -123,6 +126,7 @@ public class ChessController {
         payload.put("endX", 0); payload.put("endY", 0);
         payload.put("whiteTime", game.getWhiteTimeRemaining());
         payload.put("blackTime", game.getBlackTimeRemaining());
+        payload.put("abortTimer", game.getAbortTimerState());
 
         game.addMoveToHistory(payload);
         messagingTemplate.convertAndSend("/topic/game", (Object) payload);
@@ -150,6 +154,12 @@ public class ChessController {
         String status = game.playerMove(startX, startY, endX, endY, promotion);
 
         if (!status.contains("ERROR")) {
+            // If match ended (checkmate, draw, etc.), cancel any abort timers.
+            // Note: first-move auto-abort state progression is handled internally by game.playerMove().
+            if (!game.isMatchStarted() || game.hasMatchEnded()) {
+                game.cancelAbortTimer();
+            }
+
             Map<String, Object> payload = new HashMap<>();
             payload.put("type", "MOVE");
             payload.put("status", status);
@@ -164,6 +174,7 @@ public class ChessController {
             payload.put("blackTime", game.getBlackTimeRemaining());
             // Tell clients whose turn it is now so the correct clock starts ticking
             payload.put("currentTurn", game.getCurrentTurn().toString());
+            payload.put("abortTimer", game.getAbortTimerState());
 
             game.addMoveToHistory(payload);
             messagingTemplate.convertAndSend("/topic/game", (Object) payload);
@@ -210,6 +221,7 @@ public class ChessController {
 
         String winner = droppedColor.equals("WHITE") ? "Black" : "White";
         String status = droppedColor + " ABANDONED. " + winner + " wins!";
+        game.setCurrentStatus(status);
 
         Map<String, Object> payload = new HashMap<>();
         payload.put("type", "MOVE");
@@ -303,14 +315,18 @@ public class ChessController {
     // Helper: broadcast START message
     private void broadcastStart() {
         System.out.println("DEBUG: broadcastStart called");
+        // Start the authoritative 15-second abort timer for White
+        game.startAbortTimer(messagingTemplate);
+
         Map<String, Object> payload = new HashMap<>();
         payload.put("type", "START");
         payload.put("currentTurn", game.getCurrentTurn().toString());
-        payload.put("grid", game.getBoard());
+        payload.put("grid", getBoardState());
         payload.put("whiteTime", game.getWhiteTimeRemaining());
         payload.put("blackTime", game.getBlackTimeRemaining());
         payload.put("moveHistory", game.getMoveHistory());
         payload.put("matchStarted", true);
+        payload.put("abortTimer", game.getAbortTimerState());
         messagingTemplate.convertAndSend("/topic/game", (Object) payload);
     }
 

@@ -3,6 +3,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.*;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 public class Game {
     // The Server-Side Memory Bank
@@ -18,25 +20,67 @@ public class Game {
     // Lock for synchronizing critical state transitions
     private final Object stateLock = new Object();
 
+    // Match generation token — increments on each new match start.
+    // Used to ensure stale scheduled tasks cannot affect a newer match.
+    private volatile long matchGeneration = 0;
+
+    // Current authoritative match status and terminal flag
+    private volatile String currentStatus = "White's Turn";
+    private volatile boolean matchEnded = false;
+
+    public enum AbortPhase {
+        NONE,
+        WHITE_GRACE,
+        WHITE_WARNING,
+        BLACK_GRACE,
+        BLACK_WARNING
+    }
+
+    private volatile AbortPhase abortPhase = AbortPhase.NONE;
+    private volatile boolean whiteFirstMoveDone = false;
+    private volatile boolean blackFirstMoveDone = false;
+    private volatile long turnGeneration = 0;
+    private volatile long phaseGeneration = 0;
+
+    // Authoritative abort deadline and target color
+    private volatile long abortDeadline = 0;
+    private volatile Color abortColor = null;
+    public static final long ABORT_TIMEOUT_SECONDS = 15;
+    public static final long ABORT_TIMEOUT_MS = ABORT_TIMEOUT_SECONDS * 1000L;
+    public static final long PHASE_DURATION_SECONDS = 15;
+    public static final long PHASE_DURATION_MS = PHASE_DURATION_SECONDS * 1000L;
+
+    private volatile SimpMessagingTemplate messagingTemplate = null;
+
+    // Abort timer for "no move made" scenario (first-move-only 2-stage state machine)
+    // Use a thread pool so that a failure in one task doesn't kill the executor.
+    private final ScheduledExecutorService abortScheduler = Executors.newScheduledThreadPool(2, r -> {
+        Thread t = new Thread(r, "abort-timer-pool");
+        t.setDaemon(true);
+        return t;
+    });
+    private volatile ScheduledFuture<?> abortTimer = null;
+
     public String assignPlayer(String returningToken) {
         synchronized (stateLock) {
             // 1. Welcome back returning players
-        if (returningToken != null && !returningToken.isEmpty()) {
-            if (returningToken.equals(whiteToken)) return whiteToken;
-            if (returningToken.equals(blackToken)) return blackToken;
-        }
+            if (returningToken != null && !returningToken.isEmpty()) {
+                if ("SPECTATOR".equals(returningToken)) return "SPECTATOR";
+                if (returningToken.equals(whiteToken)) return whiteToken;
+                if (returningToken.equals(blackToken)) return blackToken;
+            }
 
-        // 2. Assign empty seats to new players and generate a secret token
-        if (whiteToken == null) {
-            whiteToken = "WHITE-" + java.util.UUID.randomUUID().toString();
-            return whiteToken;
-        }
-        if (blackToken == null) {
-            blackToken = "BLACK-" + java.util.UUID.randomUUID().toString();
-            return blackToken;
-        }
+            // 2. Assign empty seats to new players and generate a secret token
+            if (whiteToken == null) {
+                whiteToken = "WHITE-" + java.util.UUID.randomUUID().toString();
+                return whiteToken;
+            }
+            if (blackToken == null) {
+                blackToken = "BLACK-" + java.util.UUID.randomUUID().toString();
+                return blackToken;
+            }
 
-        return "SPECTATOR";
+            return "SPECTATOR";
         }
     }
 
@@ -44,6 +88,24 @@ public class Game {
     public boolean isMatchStarted() {
         synchronized (stateLock) {
             return matchStarted;
+        }
+    }
+
+    public boolean hasMatchEnded() {
+        synchronized (stateLock) {
+            return matchEnded;
+        }
+    }
+
+    public String getCurrentStatus() {
+        synchronized (stateLock) {
+            return currentStatus;
+        }
+    }
+
+    public void setCurrentStatus(String status) {
+        synchronized (stateLock) {
+            this.currentStatus = status;
         }
     }
 
@@ -95,9 +157,14 @@ public class Game {
 
             // If both players have opted in, start a new match
             if (whiteWantsRematch && blackWantsRematch) {
+                // Cancel any pending abort timer from previous match
+                cancelAbortTimerInternal(matchGeneration);
                 // Reset the shared game state for a fresh match
                 resetBoardForNewMatchInternal();
                 matchStarted = true;
+                matchEnded = false;
+                matchGeneration++;
+                turnGeneration = 0;
                 lastMoveTimestamp = System.currentTimeMillis();
 
                 // Clear rematch flags
@@ -120,11 +187,17 @@ public class Game {
     // Call this when a player clicks "Ready"
     public boolean setPlayerReady(String color) {
         synchronized (stateLock) {
+            if (matchStarted) return false;
             if ("WHITE".equals(color)) whiteReady = true;
             if ("BLACK".equals(color)) blackReady = true;
 
             if (whiteReady && blackReady) {
+                // Cancel any pending abort timer from previous match
+                cancelAbortTimerInternal(matchGeneration);
                 matchStarted = true;
+                matchEnded = false;
+                matchGeneration++;
+                turnGeneration = 0;
                 lastMoveTimestamp = System.currentTimeMillis();
                 // Reset board for fresh game (preserves readiness/seats)
                 resetBoardForNewMatchInternal();
@@ -137,7 +210,13 @@ public class Game {
     // Marks the game as officially over and freezes the clocks
     private void endMatch() {
         synchronized (stateLock) {
+            // Cancel any pending abort timer
+            cancelAbortTimerInternal(matchGeneration);
+            // Freeze the remaining time before marking match as not started
+            long frozenWhite = getWhiteTimeRemaining();
+            long frozenBlack = getBlackTimeRemaining();
             matchStarted = false;
+            matchEnded = true;
             // Reset readiness so a new match requires both players to explicitly agree
             whiteReady = false;
             blackReady = false;
@@ -145,27 +224,391 @@ public class Game {
             whiteWantsRematch = false;
             blackWantsRematch = false;
             // Freeze the remaining time so subsequent /sync calls return stable values
-            whiteTimeRemaining = getWhiteTimeRemaining();
-            blackTimeRemaining = getBlackTimeRemaining();
+            whiteTimeRemaining = frozenWhite;
+            blackTimeRemaining = frozenBlack;
             lastMoveTimestamp = System.currentTimeMillis();
         }
     }
 
-    // Action Handlers for Resign and Abort
-    public String resign(String color) {
-        endMatch();
-        return "RESIGNATION! " + ("WHITE".equals(color) ? "BLACK wins!" : "WHITE wins!");
+    // Internal endMatch used by abort timer (doesn't broadcast, just updates state)
+    private void endMatchInternal() {
+        synchronized (stateLock) {
+            // Cancel any pending abort timer
+            cancelAbortTimerInternal(matchGeneration);
+            long frozenWhite = getWhiteTimeRemaining();
+            long frozenBlack = getBlackTimeRemaining();
+            matchStarted = false;
+            matchEnded = true;
+            whiteReady = false;
+            blackReady = false;
+            whiteWantsRematch = false;
+            blackWantsRematch = false;
+            whiteTimeRemaining = frozenWhite;
+            blackTimeRemaining = frozenBlack;
+            lastMoveTimestamp = System.currentTimeMillis();
+        }
     }
 
-    public String abort() {
-        endMatch();
-        return "MATCH ABORTED! Game cancelled.";
+    // ==========================================
+    // ABORT TIMER LOGIC (authoritative, backend-driven)
+    // ==========================================
+
+    // Starts the 2-stage first-move auto-abort process for White.
+    // Stage A: 15-second silent grace period (no warning displayed).
+    private void startWhiteGracePeriodInternal(long matchGen, SimpMessagingTemplate messagingTemplate) {
+        if (abortTimer != null) {
+            abortTimer.cancel(false);
+            abortTimer = null;
+        }
+        if (!matchStarted || matchEnded) return;
+
+        abortPhase = AbortPhase.WHITE_GRACE;
+        abortColor = Color.WHITE;
+        abortDeadline = System.currentTimeMillis() + PHASE_DURATION_MS;
+        turnGeneration++;
+        phaseGeneration++;
+        final long currentPhaseGen = phaseGeneration;
+
+        abortTimer = abortScheduler.schedule(() -> {
+            try {
+                handleWhiteGraceExpired(matchGen, currentPhaseGen, messagingTemplate);
+            } catch (Exception e) {
+                System.err.println("❌ WHITE GRACE TIMER FAILED: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }, PHASE_DURATION_SECONDS, TimeUnit.SECONDS);
+
+        System.out.println("⏱️ WHITE FIRST MOVE: 15s silent grace period started (matchGen " + matchGen + ", phaseGen " + currentPhaseGen + ")");
+    }
+
+    // Called when White's 15s silent grace period expires without a move.
+    // Transitions to WHITE_WARNING: displays 15s red warning countdown in White's clock area.
+    private void handleWhiteGraceExpired(long matchGen, long expectedPhaseGen, SimpMessagingTemplate messagingTemplate) {
+        synchronized (stateLock) {
+            if (matchGeneration != matchGen || phaseGeneration != expectedPhaseGen || !matchStarted || matchEnded || abortPhase != AbortPhase.WHITE_GRACE) {
+                System.out.println("⏭️ WHITE GRACE EXPIRED SKIPPED: Stale state");
+                return;
+            }
+
+            abortPhase = AbortPhase.WHITE_WARNING;
+            abortColor = Color.WHITE;
+            abortDeadline = System.currentTimeMillis() + PHASE_DURATION_MS;
+            phaseGeneration++;
+            final long warnPhaseGen = phaseGeneration;
+
+            abortTimer = abortScheduler.schedule(() -> {
+                try {
+                    handleWarningExpired(matchGen, warnPhaseGen, Color.WHITE, messagingTemplate);
+                } catch (Exception e) {
+                    System.err.println("❌ WHITE WARNING TIMER FAILED: " + e.getMessage());
+                    e.printStackTrace();
+                }
+            }, PHASE_DURATION_SECONDS, TimeUnit.SECONDS);
+
+            System.out.println("⚠️ WHITE FIRST MOVE: 15s warning countdown started (matchGen " + matchGen + ", phaseGen " + warnPhaseGen + ")");
+        }
+
+        broadcastAbortWarning(messagingTemplate);
+    }
+
+    // Starts the 2-stage first-move auto-abort process for Black (after White moves).
+    // Stage B: 15-second silent grace period (no warning displayed).
+    private void startBlackGracePeriodInternal(long matchGen, SimpMessagingTemplate messagingTemplate) {
+        if (abortTimer != null) {
+            abortTimer.cancel(false);
+            abortTimer = null;
+        }
+        if (!matchStarted || matchEnded) return;
+
+        abortPhase = AbortPhase.BLACK_GRACE;
+        abortColor = Color.BLACK;
+        abortDeadline = System.currentTimeMillis() + PHASE_DURATION_MS;
+        turnGeneration++;
+        phaseGeneration++;
+        final long currentPhaseGen = phaseGeneration;
+
+        abortTimer = abortScheduler.schedule(() -> {
+            try {
+                handleBlackGraceExpired(matchGen, currentPhaseGen, messagingTemplate);
+            } catch (Exception e) {
+                System.err.println("❌ BLACK GRACE TIMER FAILED: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }, PHASE_DURATION_SECONDS, TimeUnit.SECONDS);
+
+        System.out.println("⏱️ BLACK FIRST MOVE: 15s silent grace period started (matchGen " + matchGen + ", phaseGen " + currentPhaseGen + ")");
+    }
+
+    // Called when Black's 15s silent grace period expires without a move.
+    // Transitions to BLACK_WARNING: displays 15s red warning countdown in Black's clock area.
+    private void handleBlackGraceExpired(long matchGen, long expectedPhaseGen, SimpMessagingTemplate messagingTemplate) {
+        synchronized (stateLock) {
+            if (matchGeneration != matchGen || phaseGeneration != expectedPhaseGen || !matchStarted || matchEnded || abortPhase != AbortPhase.BLACK_GRACE) {
+                System.out.println("⏭️ BLACK GRACE EXPIRED SKIPPED: Stale state");
+                return;
+            }
+
+            abortPhase = AbortPhase.BLACK_WARNING;
+            abortColor = Color.BLACK;
+            abortDeadline = System.currentTimeMillis() + PHASE_DURATION_MS;
+            phaseGeneration++;
+            final long warnPhaseGen = phaseGeneration;
+
+            abortTimer = abortScheduler.schedule(() -> {
+                try {
+                    handleWarningExpired(matchGen, warnPhaseGen, Color.BLACK, messagingTemplate);
+                } catch (Exception e) {
+                    System.err.println("❌ BLACK WARNING TIMER FAILED: " + e.getMessage());
+                    e.printStackTrace();
+                }
+            }, PHASE_DURATION_SECONDS, TimeUnit.SECONDS);
+
+            System.out.println("⚠️ BLACK FIRST MOVE: 15s warning countdown started (matchGen " + matchGen + ", phaseGen " + warnPhaseGen + ")");
+        }
+
+        broadcastAbortWarning(messagingTemplate);
+    }
+
+    // Handles expiration of the 15s warning period (30s total inactivity from turn start).
+    private void handleWarningExpired(long matchGen, long expectedPhaseGen, Color targetColor, SimpMessagingTemplate messagingTemplate) {
+        synchronized (stateLock) {
+            if (matchGeneration != matchGen || phaseGeneration != expectedPhaseGen || !matchStarted || matchEnded) {
+                System.out.println("⏭️ WARNING EXPIRED SKIPPED: Stale state");
+                return;
+            }
+            if ((targetColor == Color.WHITE && abortPhase != AbortPhase.WHITE_WARNING) ||
+                (targetColor == Color.BLACK && abortPhase != AbortPhase.BLACK_WARNING)) {
+                System.out.println("⏭️ WARNING EXPIRED SKIPPED: Wrong phase " + abortPhase);
+                return;
+            }
+        }
+        abortDueToInactivity(matchGen, expectedPhaseGen, targetColor, messagingTemplate);
+    }
+
+    // Broadcasts an ABORT_WARNING message with current abort timer state to /topic/game
+    private void broadcastAbortWarning(SimpMessagingTemplate messagingTemplate) {
+        try {
+            SimpMessagingTemplate template = messagingTemplate != null ? messagingTemplate : this.messagingTemplate;
+            if (template != null) {
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("type", "ABORT_WARNING");
+                payload.put("abortTimer", getAbortTimerState());
+                template.convertAndSend("/topic/game", (Object) payload);
+            }
+        } catch (Exception e) {
+            System.err.println("❌ ABORT_WARNING BROADCAST FAILED: " + e.getMessage());
+        }
+    }
+
+    // Public entry point to start the first-move auto-abort cycle on match start
+    public void startAbortTimer(SimpMessagingTemplate messagingTemplate) {
+        synchronized (stateLock) {
+            this.messagingTemplate = messagingTemplate;
+            if (!matchStarted || matchEnded) return;
+            whiteFirstMoveDone = false;
+            blackFirstMoveDone = false;
+            startWhiteGracePeriodInternal(matchGeneration, messagingTemplate);
+        }
+    }
+
+    // Cancels active abort timer and resets abort state
+    private void cancelAbortTimerInternal(long matchGen) {
+        if (abortTimer != null) {
+            abortTimer.cancel(false);
+            abortTimer = null;
+        }
+        abortDeadline = 0;
+        abortColor = null;
+        abortPhase = AbortPhase.NONE;
+        System.out.println("🛑 ABORT TIMER CANCELLED for match generation " + matchGen);
+    }
+
+    // Public entry point to cancel the abort timer on match end or reset
+    public void cancelAbortTimer() {
+        synchronized (stateLock) {
+            cancelAbortTimerInternal(matchGeneration);
+        }
+    }
+
+    // Aborts the match due to inactivity (no move made in 30 seconds total: 15s grace + 15s warning).
+    private void abortDueToInactivity(long matchGen, long expectedPhaseGen, Color targetColor, SimpMessagingTemplate messagingTemplate) {
+        String finalStatus = "MATCH ABORTED! " + targetColor + " did not make a move in 30 seconds.";
+        List<List<String>> boardGrid;
+        synchronized (stateLock) {
+            if (matchGeneration != matchGen || phaseGeneration != expectedPhaseGen || !matchStarted || matchEnded) {
+                System.out.println("⏭️ ABORT SKIPPED: Stale generation or match not active");
+                return;
+            }
+            // End the match
+            endMatchInternal();
+            currentStatus = finalStatus;
+            matchEnded = true;
+            abortPhase = AbortPhase.NONE;
+            abortDeadline = 0;
+            abortColor = null;
+            boardGrid = getBoardStateForBroadcast();
+            System.out.println("💥 MATCH ABORTED: " + finalStatus);
+        }
+        // Broadcast abort notification
+        try {
+            SimpMessagingTemplate template = messagingTemplate != null ? messagingTemplate : this.messagingTemplate;
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("type", "ABORT_TIMEOUT");
+            payload.put("status", finalStatus);
+            payload.put("color", targetColor.toString());
+            payload.put("grid", boardGrid);
+            if (template != null) {
+                template.convertAndSend("/topic/game", (Object) payload);
+            }
+        } catch (Exception e) {
+            System.err.println("❌ ABORT_TIMEOUT BROADCAST FAILED for matchGen " + matchGen + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    // Helper to get board state for broadcast (used in abort timeout)
+    private List<List<String>> getBoardStateForBroadcast() {
+        List<List<String>> grid = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            List<String> row = new ArrayList<>();
+            for (int j = 0; j < 8; j++) {
+                Piece p = board.getBox(i, j).getPiece();
+                if (p == null) {
+                    row.add("");
+                } else {
+                    String color = p.getColor() == Color.WHITE ? "w" : "b";
+                    String type;
+                    if (p instanceof King) type = "K";
+                    else if (p instanceof Queen) type = "Q";
+                    else if (p instanceof Rook) type = "R";
+                    else if (p instanceof Bishop) type = "B";
+                    else if (p instanceof Knight) type = "N";
+                    else if (p instanceof Pawn) type = "P";
+                    else type = "";
+                    row.add(color + type);
+                }
+            }
+            grid.add(row);
+        }
+        return grid;
     }
 
     public List<Map<String, Object>> getMoveHistory() {
         synchronized (stateLock) {
             return new ArrayList<>(moveHistory);
         }
+    }
+
+    // Returns the state of the abort timer for synchronization and reconnection recovery.
+    // warningActive is true ONLY during the 15-second warning phase (WHITE_WARNING / BLACK_WARNING).
+    public Map<String, Object> getAbortTimerState() {
+        synchronized (stateLock) {
+            Map<String, Object> state = new HashMap<>();
+            if (!matchStarted || matchEnded || abortPhase == AbortPhase.NONE || abortDeadline <= 0) {
+                state.put("active", false);
+                state.put("warningActive", false);
+                state.put("phase", abortPhase.name());
+                return state;
+            }
+            long now = System.currentTimeMillis();
+            long remainingMs = Math.max(0, abortDeadline - now);
+            int remainingSeconds = (int) Math.ceil(remainingMs / 1000.0);
+            boolean isWarning = (abortPhase == AbortPhase.WHITE_WARNING || abortPhase == AbortPhase.BLACK_WARNING);
+
+            state.put("active", true);
+            state.put("phase", abortPhase.name());
+            state.put("warningActive", isWarning);
+            state.put("color", abortColor != null ? abortColor.toString() : currentTurn.toString());
+            state.put("deadline", abortDeadline);
+            state.put("remainingSeconds", remainingSeconds);
+            state.put("matchGeneration", matchGeneration);
+            state.put("turnGeneration", turnGeneration);
+            state.put("phaseGeneration", phaseGeneration);
+            state.put("whiteFirstMoveDone", whiteFirstMoveDone);
+            state.put("blackFirstMoveDone", blackFirstMoveDone);
+            return state;
+        }
+    }
+
+    // Testing accessors for controlled unit testing without weakening production timeouts
+    public long getTurnGeneration() {
+        synchronized (stateLock) {
+            return turnGeneration;
+        }
+    }
+
+    public long getPhaseGeneration() {
+        synchronized (stateLock) {
+            return phaseGeneration;
+        }
+    }
+
+    public long getAbortDeadline() {
+        synchronized (stateLock) {
+            return abortDeadline;
+        }
+    }
+
+    public Color getAbortColor() {
+        synchronized (stateLock) {
+            return abortColor;
+        }
+    }
+
+    public AbortPhase getAbortPhase() {
+        synchronized (stateLock) {
+            return abortPhase;
+        }
+    }
+
+    public boolean isWhiteFirstMoveDone() {
+        synchronized (stateLock) {
+            return whiteFirstMoveDone;
+        }
+    }
+
+    public boolean isBlackFirstMoveDone() {
+        synchronized (stateLock) {
+            return blackFirstMoveDone;
+        }
+    }
+
+    public void setMessagingTemplate(SimpMessagingTemplate template) {
+        this.messagingTemplate = template;
+    }
+
+    // Testing helper: triggers expiration of the current silent grace period
+    public void triggerGracePeriodExpiryForTesting() {
+        long mGen;
+        long pGen;
+        AbortPhase phase;
+        SimpMessagingTemplate template;
+        synchronized (stateLock) {
+            mGen = matchGeneration;
+            pGen = phaseGeneration;
+            phase = abortPhase;
+            template = this.messagingTemplate;
+        }
+        if (phase == AbortPhase.WHITE_GRACE) {
+            handleWhiteGraceExpired(mGen, pGen, template);
+        } else if (phase == AbortPhase.BLACK_GRACE) {
+            handleBlackGraceExpired(mGen, pGen, template);
+        }
+    }
+
+    // Testing helper: triggers timeout abort during warning phase
+    public void triggerAbortTimeoutForTesting(SimpMessagingTemplate messagingTemplate) {
+        long mGen;
+        long pGen;
+        Color col;
+        SimpMessagingTemplate template;
+        synchronized (stateLock) {
+            mGen = matchGeneration;
+            pGen = phaseGeneration;
+            col = abortColor;
+            template = messagingTemplate != null ? messagingTemplate : this.messagingTemplate;
+        }
+        handleWarningExpired(mGen, pGen, col, template);
     }
 
     public void addMoveToHistory(Map<String, Object> movePayload) {
@@ -183,6 +626,25 @@ public class Game {
     public void addChatToHistory(Map<String, Object> chatPayload) {
         synchronized (stateLock) {
             chatHistory.add(chatPayload);
+        }
+    }
+
+    // Action Handlers for Resign and Abort
+    public String resign(String color) {
+        synchronized (stateLock) {
+            String status = "RESIGNATION! " + ("WHITE".equals(color) ? "BLACK wins!" : "WHITE wins!");
+            endMatch();
+            currentStatus = status;
+            return status;
+        }
+    }
+
+    public String abort() {
+        synchronized (stateLock) {
+            String status = "MATCH ABORTED! Game cancelled.";
+            endMatch();
+            currentStatus = status;
+            return status;
         }
     }
 
@@ -236,6 +698,9 @@ public class Game {
     // ==========================================
     public void resetGame() {
         synchronized (stateLock) {
+            cancelAbortTimerInternal(matchGeneration);
+            matchGeneration++;
+
             this.board = new Board();
             this.currentTurn = Color.WHITE;
             this.moveHistory.clear(); // Clear move history so fetchBoard() doesn't rebuild from stale data
@@ -244,6 +709,11 @@ public class Game {
             this.whiteReady = false;
             this.blackReady = false;
             this.matchStarted = false;
+            this.matchEnded = false;
+            this.whiteFirstMoveDone = false;
+            this.blackFirstMoveDone = false;
+            this.abortPhase = AbortPhase.NONE;
+            this.currentStatus = "White's Turn";
 
             // Reset Rematch Opt-In State
             this.whiteWantsRematch = false;
@@ -271,6 +741,11 @@ public class Game {
         this.board = new Board();
         this.currentTurn = Color.WHITE;
         this.moveHistory.clear();
+        this.currentStatus = "White's Turn";
+        this.matchEnded = false;
+        this.whiteFirstMoveDone = false;
+        this.blackFirstMoveDone = false;
+        this.abortPhase = AbortPhase.NONE;
 
         // Reset Draw Trackers
         this.halfMoveClock = 0;
@@ -307,10 +782,11 @@ public class Game {
     // MAIN MOVE ENGINE
     // ==========================================
     public String playerMove(int startX, int startY, int endX, int endY, String promotion) {
-        // Guard: reject moves if the match is not active
-        if (!matchStarted) {
-            return "ERROR: Match has not started!";
-        }
+        synchronized (stateLock) {
+            // Guard: reject moves if the match is not active
+            if (!matchStarted) {
+                return "ERROR: Match has not started!";
+            }
 
         Spot startBox = board.getBox(startX, startY);
         Spot endBox = board.getBox(endX, endY);
@@ -377,14 +853,18 @@ public class Game {
             if (whiteTimeRemaining <= 0) {
                 whiteTimeRemaining = 0;
                 endMatch();
-                return "TIME_OUT! Black wins on time!";
+                String status = "TIME_OUT! Black wins on time!";
+                currentStatus = status;
+                return status;
             }
         } else {
             blackTimeRemaining -= elapsed;
             if (blackTimeRemaining <= 0) {
                 blackTimeRemaining = 0;
                 endMatch();
-                return "TIME_OUT! White wins on time!";
+                String status = "TIME_OUT! White wins on time!";
+                currentStatus = status;
+                return status;
             }
         }
         lastMoveTimestamp = currentTime;
@@ -495,7 +975,27 @@ public class Game {
             }
         }
 
+        currentStatus = resultMessage;
+
+        // Auto-abort first-move progression: only applies to move 1 of White and move 1 of Black
+        if (pieceToMove.getColor() == Color.WHITE && !whiteFirstMoveDone) {
+            whiteFirstMoveDone = true;
+            if (abortTimer != null) {
+                abortTimer.cancel(false);
+                abortTimer = null;
+            }
+            if (!matchEnded && matchStarted) {
+                startBlackGracePeriodInternal(matchGeneration, this.messagingTemplate);
+            }
+        } else if (pieceToMove.getColor() == Color.BLACK && !blackFirstMoveDone) {
+            blackFirstMoveDone = true;
+            cancelAbortTimerInternal(matchGeneration);
+            abortPhase = AbortPhase.NONE;
+            System.out.println("✅ BOTH FIRST MOVES COMPLETE: Auto-abort permanently disabled for remainder of match.");
+        }
+
         return resultMessage;
+        }
     }
 
     // ==========================================
@@ -547,25 +1047,31 @@ public class Game {
 
     // Allows the server to explicitly check for a timeout without needing a move
     public String checkTimeout() {
-        if (!matchStarted) return "SAFE";
+        synchronized (stateLock) {
+            if (!matchStarted) return "SAFE";
 
-        long currentTime = System.currentTimeMillis();
-        long elapsed = currentTime - lastMoveTimestamp;
+            long currentTime = System.currentTimeMillis();
+            long elapsed = currentTime - lastMoveTimestamp;
 
-        if (currentTurn == Color.WHITE) {
-            if (whiteTimeRemaining - elapsed <= 0) {
-                whiteTimeRemaining = 0;
-                endMatch();
-                return "TIME_OUT! Black wins on time!";
+            if (currentTurn == Color.WHITE) {
+                if (whiteTimeRemaining - elapsed <= 0) {
+                    whiteTimeRemaining = 0;
+                    endMatch();
+                    String status = "TIME_OUT! Black wins on time!";
+                    currentStatus = status;
+                    return status;
+                }
+            } else {
+                if (blackTimeRemaining - elapsed <= 0) {
+                    blackTimeRemaining = 0;
+                    endMatch();
+                    String status = "TIME_OUT! White wins on time!";
+                    currentStatus = status;
+                    return status;
+                }
             }
-        } else {
-            if (blackTimeRemaining - elapsed <= 0) {
-                blackTimeRemaining = 0;
-                endMatch();
-                return "TIME_OUT! White wins on time!";
-            }
+            return "SAFE";
         }
-        return "SAFE";
     }
 
     // Returns a list of valid [x, y] coordinates for a given piece
