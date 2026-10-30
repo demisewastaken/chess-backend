@@ -1,8 +1,12 @@
 package com.chess.engine;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 
@@ -13,9 +17,11 @@ public class Game {
     private Board board;
     private Color currentTurn;
 
-    // SECRET TOKEN TRACKERS
+    // SECRET TOKEN TRACKERS & REVOKED TOKENS REGISTRY
     private String whiteToken = null;
     private String blackToken = null;
+    private final Set<String> revokedTokens = Collections.synchronizedSet(new HashSet<>());
+    private final Set<String> activeSpectators = Collections.synchronizedSet(new LinkedHashSet<>());
 
     // Lock for synchronizing critical state transitions
     private final Object stateLock = new Object();
@@ -63,23 +69,67 @@ public class Game {
 
     public String assignPlayer(String returningToken) {
         synchronized (stateLock) {
-            // 1. Welcome back returning players
-            if (returningToken != null && !returningToken.isEmpty()) {
-                if ("SPECTATOR".equals(returningToken)) return "SPECTATOR";
-                if (returningToken.equals(whiteToken)) return whiteToken;
-                if (returningToken.equals(blackToken)) return blackToken;
+            String cleanToken = (returningToken != null) ? returningToken.trim() : null;
+
+            // 1. Welcome back returning active players only if valid and not revoked
+            if (cleanToken != null && !cleanToken.isEmpty() && !revokedTokens.contains(cleanToken)) {
+                if (cleanToken.equals(whiteToken)) return whiteToken;
+                if (cleanToken.equals(blackToken)) return blackToken;
             }
 
-            // 2. Assign empty seats to new players and generate a secret token
-            if (whiteToken == null) {
-                whiteToken = "WHITE-" + java.util.UUID.randomUUID().toString();
-                return whiteToken;
-            }
-            if (blackToken == null) {
-                blackToken = "BLACK-" + java.util.UUID.randomUUID().toString();
-                return blackToken;
+            // 2. An old revoked player token cannot reclaim a seat or be promoted
+            if (cleanToken != null && revokedTokens.contains(cleanToken)) {
+                return "SPECTATOR";
             }
 
+            // 3. If an active match is in progress, do not allow spectator promotion or new player seat assignment
+            if (matchStarted && !matchEnded) {
+                if (cleanToken != null && !cleanToken.isEmpty()) {
+                    activeSpectators.add(cleanToken);
+                }
+                return "SPECTATOR";
+            }
+
+            // 4. Check available seats:
+            // Seats are available if whiteToken == null or blackToken == null.
+            boolean whiteAvailable = (whiteToken == null);
+            boolean blackAvailable = (blackToken == null);
+
+            if (whiteAvailable || blackAvailable) {
+                // Determine seat assignment priority: WHITE first, then BLACK
+                String assignedToken;
+                if (whiteAvailable) {
+                    assignedToken = "WHITE-" + java.util.UUID.randomUUID().toString();
+                    whiteToken = assignedToken;
+                    whiteReady = false;
+                } else {
+                    assignedToken = "BLACK-" + java.util.UUID.randomUUID().toString();
+                    blackToken = assignedToken;
+                    blackReady = false;
+                }
+
+                // If this was a registered spectator being promoted, remove from activeSpectators
+                if (cleanToken != null) {
+                    activeSpectators.remove(cleanToken);
+                }
+                return assignedToken;
+            }
+
+            // 5. Both seats are occupied -> Client becomes or remains a SPECTATOR
+            if (cleanToken != null && !cleanToken.isEmpty()) {
+                activeSpectators.add(cleanToken);
+            }
+            return "SPECTATOR";
+        }
+    }
+
+    public String getPlayerColor(String token) {
+        synchronized (stateLock) {
+            if (token == null || token.isEmpty() || revokedTokens.contains(token)) {
+                return "SPECTATOR";
+            }
+            if (token.equals(whiteToken)) return "WHITE";
+            if (token.equals(blackToken)) return "BLACK";
             return "SPECTATOR";
         }
     }
@@ -122,12 +172,12 @@ public class Game {
     }
     public boolean getWhiteWantsRematch() {
         synchronized (stateLock) {
-            return whiteWantsRematch;
+            return "WHITE".equals(rematchRequester) && rematchStatus == RematchStatus.PENDING;
         }
     }
     public boolean getBlackWantsRematch() {
         synchronized (stateLock) {
-            return blackWantsRematch;
+            return "BLACK".equals(rematchRequester) && rematchStatus == RematchStatus.PENDING;
         }
     }
 
@@ -136,52 +186,258 @@ public class Game {
     private boolean blackReady = false;
     private boolean matchStarted = false;
 
-    // PER-PLAYER REMATCH/NEW-GAME OPT-IN STATE
-    private boolean whiteWantsRematch = false;
-    private boolean blackWantsRematch = false;
+    // PER-PLAYER REMATCH STATE MACHINE
+    public enum RematchStatus {
+        NONE,
+        PENDING,
+        ACCEPTED,
+        DECLINED,
+        CANCELLED,
+        EXPIRED
+    }
 
-    // Call this when a player clicks "Ready" or requests a rematch after game end
-    // Returns true if both players have opted in and a new match should start
+    public static final long REMATCH_DURATION_SECONDS = 15;
+    public static final long REMATCH_DURATION_MS = REMATCH_DURATION_SECONDS * 1000L;
+
+    private volatile RematchStatus rematchStatus = RematchStatus.NONE;
+    private volatile String rematchRequester = null;
+    private volatile String rematchTarget = null;
+    private volatile long rematchDeadline = 0L;
+    private volatile long rematchRequestId = 0L;
+    private volatile ScheduledFuture<?> rematchTimer = null;
+
+    public RematchStatus getRematchStatus() {
+        synchronized (stateLock) {
+            return rematchStatus;
+        }
+    }
+
+    public String getRematchRequester() {
+        synchronized (stateLock) {
+            return rematchRequester;
+        }
+    }
+
+    public String getRematchTarget() {
+        synchronized (stateLock) {
+            return rematchTarget;
+        }
+    }
+
+    public long getRematchDeadline() {
+        synchronized (stateLock) {
+            return rematchDeadline;
+        }
+    }
+
+    // Mutual Rematch Request: initiates or confirms a rematch
     public Map<String, Object> requestRematch(String color) {
         synchronized (stateLock) {
             Map<String, Object> result = new HashMap<>();
 
-            if ("WHITE".equals(color)) {
-                whiteWantsRematch = true;
-            } else if ("BLACK".equals(color)) {
-                blackWantsRematch = true;
-            }
-
-            result.put("whiteWantsRematch", whiteWantsRematch);
-            result.put("blackWantsRematch", blackWantsRematch);
-
-            // If both players have opted in, start a new match
-            if (whiteWantsRematch && blackWantsRematch) {
-                // Cancel any pending abort timer from previous match
-                cancelAbortTimerInternal(matchGeneration);
-                // Reset the shared game state for a fresh match
-                resetBoardForNewMatchInternal();
-                matchStarted = true;
-                matchEnded = false;
-                matchGeneration++;
-                turnGeneration = 0;
-                lastMoveTimestamp = System.currentTimeMillis();
-
-                // Clear rematch flags
-                whiteWantsRematch = false;
-                blackWantsRematch = false;
-
-                // Also reset ready flags since we're starting fresh
-                whiteReady = false;
-                blackReady = false;
-
-                result.put("matchStarted", true);
-            } else {
+            // Spectators cannot request or participate in rematches
+            if (color == null || (!"WHITE".equals(color) && !"BLACK".equals(color))) {
+                result.put("success", false);
+                result.put("error", "Spectators cannot request or participate in rematches.");
                 result.put("matchStarted", false);
+                result.put("rematchState", getRematchStateInternal());
+                return result;
             }
 
+            // Rematch only allowed when match has ended
+            if (!matchEnded && matchStarted) {
+                result.put("success", false);
+                result.put("error", "Cannot request rematch while match is in progress.");
+                result.put("matchStarted", false);
+                result.put("rematchState", getRematchStateInternal());
+                return result;
+            }
+
+            // If a rematch request is already active
+            if (rematchStatus == RematchStatus.PENDING) {
+                // If the same player requests again, treat as idempotent (do not create new timer/overwrite)
+                if (color.equals(rematchRequester)) {
+                    result.put("success", true);
+                    result.put("alreadyPending", true);
+                    result.put("status", "PENDING");
+                    result.put("matchStarted", false);
+                    result.put("rematchState", getRematchStateInternal());
+                    return result;
+                }
+
+                // If the opponent (target) calls requestRematch, treat as acceptance!
+                if (color.equals(rematchTarget)) {
+                    boolean accepted = acceptRematchInternal(color);
+                    result.put("success", accepted);
+                    result.put("status", accepted ? "ACCEPTED" : "EXPIRED");
+                    result.put("matchStarted", accepted);
+                    result.put("rematchState", getRematchStateInternal());
+                    return result;
+                }
+            }
+
+            // Otherwise, start a new pending rematch request
+            cancelRematchTimerInternal();
+
+            rematchRequestId++;
+            rematchStatus = RematchStatus.PENDING;
+            rematchRequester = color;
+            rematchTarget = "WHITE".equals(color) ? "BLACK" : "WHITE";
+            rematchDeadline = System.currentTimeMillis() + REMATCH_DURATION_MS;
+
+            long reqId = rematchRequestId;
+            long mGen = matchGeneration;
+            rematchTimer = abortScheduler.schedule(() -> {
+                handleRematchExpiredInternal(reqId, mGen);
+            }, REMATCH_DURATION_MS, TimeUnit.MILLISECONDS);
+
+            result.put("success", true);
+            result.put("status", "PENDING");
+            result.put("matchStarted", false);
+            result.put("rematchState", getRematchStateInternal());
             return result;
         }
+    }
+
+    public boolean acceptRematch(String color) {
+        synchronized (stateLock) {
+            return acceptRematchInternal(color);
+        }
+    }
+
+    private boolean acceptRematchInternal(String color) {
+        if (color == null || (!"WHITE".equals(color) && !"BLACK".equals(color))) {
+            return false;
+        }
+        if (rematchStatus != RematchStatus.PENDING) {
+            return false;
+        }
+        if (!color.equals(rematchTarget)) {
+            return false;
+        }
+        if (System.currentTimeMillis() > rematchDeadline) {
+            cancelRematchTimerInternal();
+            rematchStatus = RematchStatus.EXPIRED;
+            return false;
+        }
+
+        cancelRematchTimerInternal();
+        rematchStatus = RematchStatus.ACCEPTED;
+
+        // Cancel any pending abort timer from previous match
+        cancelAbortTimerInternal(matchGeneration);
+        // Reset the shared game state for a fresh match (preserves seats and tokens)
+        resetBoardForNewMatchInternal();
+        matchStarted = true;
+        matchEnded = false;
+        matchGeneration++;
+        turnGeneration = 0;
+        lastMoveTimestamp = System.currentTimeMillis();
+
+        // Clear rematch flags for the new match
+        rematchStatus = RematchStatus.NONE;
+        rematchRequester = null;
+        rematchTarget = null;
+        rematchDeadline = 0L;
+        whiteReady = false;
+        blackReady = false;
+
+        return true;
+    }
+
+    public boolean declineRematch(String color) {
+        synchronized (stateLock) {
+            if (color == null || (!"WHITE".equals(color) && !"BLACK".equals(color))) {
+                return false;
+            }
+            if (rematchStatus != RematchStatus.PENDING) {
+                return false;
+            }
+            if (!color.equals(rematchTarget)) {
+                return false;
+            }
+
+            cancelRematchTimerInternal();
+            rematchStatus = RematchStatus.DECLINED;
+            return true;
+        }
+    }
+
+    public boolean cancelRematch(String color) {
+        synchronized (stateLock) {
+            if (color == null || (!"WHITE".equals(color) && !"BLACK".equals(color))) {
+                return false;
+            }
+            if (rematchStatus != RematchStatus.PENDING) {
+                return false;
+            }
+            if (!color.equals(rematchRequester)) {
+                return false;
+            }
+
+            cancelRematchTimerInternal();
+            rematchStatus = RematchStatus.CANCELLED;
+            return true;
+        }
+    }
+
+    public void handleRematchExpiredInternal(long reqId, long mGen) {
+        boolean shouldBroadcast = false;
+        synchronized (stateLock) {
+            if (rematchRequestId != reqId || matchGeneration != mGen || rematchStatus != RematchStatus.PENDING) {
+                return;
+            }
+            cancelRematchTimerInternal();
+            rematchStatus = RematchStatus.EXPIRED;
+            shouldBroadcast = true;
+        }
+
+        if (shouldBroadcast && messagingTemplate != null) {
+            try {
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("type", "REMATCH_EXPIRED");
+                payload.put("rematchState", getRematchState());
+                messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+            } catch (Exception e) {
+                System.err.println("❌ REMATCH_EXPIRED broadcast failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private void cancelRematchTimerInternal() {
+        if (rematchTimer != null) {
+            rematchTimer.cancel(false);
+            rematchTimer = null;
+        }
+    }
+
+    public Map<String, Object> getRematchState() {
+        synchronized (stateLock) {
+            return getRematchStateInternal();
+        }
+    }
+
+    private Map<String, Object> getRematchStateInternal() {
+        Map<String, Object> state = new HashMap<>();
+        state.put("status", rematchStatus.name());
+        state.put("requester", rematchRequester);
+        state.put("target", rematchTarget);
+        state.put("deadline", rematchDeadline);
+        long remainingMs = Math.max(0, rematchDeadline - System.currentTimeMillis());
+        int remainingSeconds = (int) Math.ceil(remainingMs / 1000.0);
+        state.put("remainingSeconds", rematchStatus == RematchStatus.PENDING ? remainingSeconds : 0);
+        state.put("requestId", rematchRequestId);
+        return state;
+    }
+
+    public void expireRematchForTesting() {
+        long reqId;
+        long mGen;
+        synchronized (stateLock) {
+            reqId = rematchRequestId;
+            mGen = matchGeneration;
+        }
+        handleRematchExpiredInternal(reqId, mGen);
     }
 
     // Call this when a player clicks "Ready"
@@ -212,6 +468,13 @@ public class Game {
         synchronized (stateLock) {
             // Cancel any pending abort timer
             cancelAbortTimerInternal(matchGeneration);
+            // Cancel any pending rematch timer and clean rematch state
+            cancelRematchTimerInternal();
+            rematchStatus = RematchStatus.NONE;
+            rematchRequester = null;
+            rematchTarget = null;
+            rematchDeadline = 0L;
+
             // Freeze the remaining time before marking match as not started
             long frozenWhite = getWhiteTimeRemaining();
             long frozenBlack = getBlackTimeRemaining();
@@ -220,9 +483,6 @@ public class Game {
             // Reset readiness so a new match requires both players to explicitly agree
             whiteReady = false;
             blackReady = false;
-            // Reset rematch opt-in flags
-            whiteWantsRematch = false;
-            blackWantsRematch = false;
             // Freeze the remaining time so subsequent /sync calls return stable values
             whiteTimeRemaining = frozenWhite;
             blackTimeRemaining = frozenBlack;
@@ -235,14 +495,19 @@ public class Game {
         synchronized (stateLock) {
             // Cancel any pending abort timer
             cancelAbortTimerInternal(matchGeneration);
+            // Cancel any pending rematch timer and clean rematch state
+            cancelRematchTimerInternal();
+            rematchStatus = RematchStatus.NONE;
+            rematchRequester = null;
+            rematchTarget = null;
+            rematchDeadline = 0L;
+
             long frozenWhite = getWhiteTimeRemaining();
             long frozenBlack = getBlackTimeRemaining();
             matchStarted = false;
             matchEnded = true;
             whiteReady = false;
             blackReady = false;
-            whiteWantsRematch = false;
-            blackWantsRematch = false;
             whiteTimeRemaining = frozenWhite;
             blackTimeRemaining = frozenBlack;
             lastMoveTimestamp = System.currentTimeMillis();
@@ -699,6 +964,7 @@ public class Game {
     public void resetGame() {
         synchronized (stateLock) {
             cancelAbortTimerInternal(matchGeneration);
+            cancelRematchTimerInternal();
             matchGeneration++;
 
             this.board = new Board();
@@ -715,9 +981,11 @@ public class Game {
             this.abortPhase = AbortPhase.NONE;
             this.currentStatus = "White's Turn";
 
-            // Reset Rematch Opt-In State
-            this.whiteWantsRematch = false;
-            this.blackWantsRematch = false;
+            // Reset Rematch State Machine
+            this.rematchStatus = RematchStatus.NONE;
+            this.rematchRequester = null;
+            this.rematchTarget = null;
+            this.rematchDeadline = 0L;
 
             // Reset Draw Trackers
             this.halfMoveClock = 0;
@@ -768,8 +1036,96 @@ public class Game {
 
     // LEAVE TABLE METHOD
     public void clearSeats() {
-        this.whiteToken = null;
-        this.blackToken = null;
+        synchronized (stateLock) {
+            if (whiteToken != null) revokedTokens.add(whiteToken);
+            if (blackToken != null) revokedTokens.add(blackToken);
+            this.whiteToken = null;
+            this.blackToken = null;
+            this.activeSpectators.clear();
+        }
+    }
+
+    private void cleanInitialLobbyStateInternal() {
+        cancelAbortTimerInternal(matchGeneration);
+        cancelRematchTimerInternal();
+        matchGeneration++;
+
+        this.board = new Board();
+        this.currentTurn = Color.WHITE;
+        this.moveHistory.clear();
+        this.positionHistory.clear();
+        this.halfMoveClock = 0;
+
+        this.whiteReady = false;
+        this.blackReady = false;
+        this.matchStarted = false;
+        this.matchEnded = false;
+        this.whiteFirstMoveDone = false;
+        this.blackFirstMoveDone = false;
+        this.abortPhase = AbortPhase.NONE;
+        this.currentStatus = "White's Turn";
+
+        this.rematchStatus = RematchStatus.NONE;
+        this.rematchRequester = null;
+        this.rematchTarget = null;
+        this.rematchDeadline = 0L;
+
+        this.whiteTimeRemaining = 10 * 60 * 1000;
+        this.blackTimeRemaining = 10 * 60 * 1000;
+        this.lastMoveTimestamp = System.currentTimeMillis();
+    }
+
+    // RELEASES ONLY THE SPECIFIED PLAYER'S SEAT (Pre-match readiness / waiting screen departure)
+    public boolean releasePlayerSeat(String token, String color) {
+        synchronized (stateLock) {
+            // Guard 1: Cannot release seats if a match is actively in progress
+            if (matchStarted && !matchEnded) {
+                return false;
+            }
+
+            // Guard 2: Token and color must be non-null and non-empty
+            if (token == null || token.trim().isEmpty() || color == null) {
+                return false;
+            }
+            String cleanToken = token.trim();
+
+            boolean released = false;
+
+            if ("WHITE".equalsIgnoreCase(color)) {
+                if (whiteToken != null && whiteToken.equals(cleanToken)) {
+                    revokedTokens.add(whiteToken);
+                    whiteToken = null;
+                    whiteReady = false;
+                    released = true;
+                }
+            } else if ("BLACK".equalsIgnoreCase(color)) {
+                if (blackToken != null && blackToken.equals(cleanToken)) {
+                    revokedTokens.add(blackToken);
+                    blackToken = null;
+                    blackReady = false;
+                    released = true;
+                }
+            }
+
+            // If both seats are now empty and no match is active, clean the lobby state
+            if (released && whiteToken == null && blackToken == null && (!matchStarted || matchEnded)) {
+                cleanInitialLobbyStateInternal();
+            }
+
+            return released;
+        }
+    }
+
+    public boolean isTokenRevoked(String token) {
+        return token != null && revokedTokens.contains(token);
+    }
+
+    public boolean isPlayerTokenActive(String token) {
+        synchronized (stateLock) {
+            if (token == null || token.isEmpty()) return false;
+            if (revokedTokens.contains(token)) return false;
+            return token.equals(whiteToken) || token.equals(blackToken);
+        }
     }
 
     public Board getBoard() {

@@ -63,6 +63,7 @@ public class ChessController {
         state.put("moveHistory", game.getMoveHistory());
         state.put("chatHistory", game.getChatHistory());
         state.put("matchStarted", game.isMatchStarted());
+        state.put("matchEnded", game.hasMatchEnded());
         // Tell the client whose turn it is so the correct clock ticks
         state.put("currentTurn", game.getCurrentTurn().toString());
         // Per-player state for post-game rematch/new-game flow
@@ -72,6 +73,8 @@ public class ChessController {
         state.put("blackReady", game.isBlackReady());
         // Abort timer state for reconnection recovery
         state.put("abortTimer", game.getAbortTimerState());
+        // Rematch state machine for reconnection recovery
+        state.put("rematchState", game.getRematchState());
         return state;
     }
 
@@ -80,11 +83,7 @@ public class ChessController {
     public String playerReady(@RequestParam String color) {
         // If match has ended, use the rematch opt-in mechanism
         if (game.hasMatchEnded()) {
-            Map<String, Object> result = game.requestRematch(color);
-            if ((Boolean) result.get("matchStarted")) {
-                broadcastStart();
-            }
-            // DO NOT broadcast REMATCH_STATE globally - it incorrectly forces opponent into Waiting
+            playerRematch(color);
             return "OK";
         }
 
@@ -101,11 +100,56 @@ public class ChessController {
     // Endpoint for player-specific Rematch/New-Game opt-in
     @GetMapping("/rematch")
     public Map<String, Object> playerRematch(@RequestParam String color) {
+        game.setMessagingTemplate(messagingTemplate);
         Map<String, Object> result = game.requestRematch(color);
-        if ((Boolean) result.get("matchStarted")) {
+        if (Boolean.TRUE.equals(result.get("matchStarted"))) {
+            broadcastStart();
+        } else if (Boolean.TRUE.equals(result.get("success")) && !Boolean.TRUE.equals(result.get("alreadyPending"))) {
+            broadcastRematchRequested();
+        }
+        return result;
+    }
+
+    @GetMapping("/rematch/request")
+    public Map<String, Object> requestRematchEndpoint(@RequestParam String color) {
+        return playerRematch(color);
+    }
+
+    @GetMapping("/rematch/accept")
+    public Map<String, Object> acceptRematchEndpoint(@RequestParam String color) {
+        game.setMessagingTemplate(messagingTemplate);
+        boolean accepted = game.acceptRematch(color);
+        Map<String, Object> result = new HashMap<>();
+        result.put("success", accepted);
+        result.put("matchStarted", accepted);
+        if (accepted) {
             broadcastStart();
         }
-        // DO NOT broadcast REMATCH_STATE globally - it incorrectly forces opponent into Waiting
+        result.put("rematchState", game.getRematchState());
+        return result;
+    }
+
+    @GetMapping("/rematch/decline")
+    public Map<String, Object> declineRematchEndpoint(@RequestParam String color) {
+        boolean declined = game.declineRematch(color);
+        Map<String, Object> result = new HashMap<>();
+        result.put("success", declined);
+        if (declined) {
+            broadcastRematchDeclined(color);
+        }
+        result.put("rematchState", game.getRematchState());
+        return result;
+    }
+
+    @GetMapping("/rematch/cancel")
+    public Map<String, Object> cancelRematchEndpoint(@RequestParam String color) {
+        boolean cancelled = game.cancelRematch(color);
+        Map<String, Object> result = new HashMap<>();
+        result.put("success", cancelled);
+        if (cancelled) {
+            broadcastRematchCancelled(color);
+        }
+        result.put("rematchState", game.getRematchState());
         return result;
     }
 
@@ -205,6 +249,25 @@ public class ChessController {
         messagingTemplate.convertAndSend("/topic/game", payload);
 
         return "Table Cleared";
+    }
+
+    // Player-Specific Exit for pre-match readiness & waiting screens
+    // Releases ONLY the departing player's seat and token without resetting the game or kicking opponent
+    @GetMapping("/player/leave")
+    public Map<String, Object> leaveSeat(@RequestParam(required = false) String token, @RequestParam String color) {
+        if (token == null || token.trim().isEmpty()) {
+            Map<String, Object> response = new HashMap<>();
+            response.put("success", false);
+            response.put("error", "Token is required");
+            response.put("color", color);
+            return response;
+        }
+        disarmGhostTimer(color);
+        boolean released = game.releasePlayerSeat(token.trim(), color);
+        Map<String, Object> response = new HashMap<>();
+        response.put("success", released);
+        response.put("color", color);
+        return response;
     }
 
     // ==========================================
@@ -337,6 +400,37 @@ public class ChessController {
         payload.put("whiteWantsRematch", game.getWhiteWantsRematch());
         payload.put("blackWantsRematch", game.getBlackWantsRematch());
         messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+    }
+
+    private void broadcastRematchRequested() {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "REMATCH_REQUESTED");
+        payload.put("rematchState", game.getRematchState());
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+    }
+
+    private void broadcastRematchDeclined(String declinedBy) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "REMATCH_DECLINED");
+        payload.put("declinedBy", declinedBy);
+        payload.put("rematchState", game.getRematchState());
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+    }
+
+    private void broadcastRematchCancelled(String cancelledBy) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "REMATCH_CANCELLED");
+        payload.put("cancelledBy", cancelledBy);
+        payload.put("rematchState", game.getRematchState());
+        messagingTemplate.convertAndSend("/topic/game", (Object) payload);
+    }
+
+    public Game getGame() {
+        return game;
+    }
+
+    public void setMessagingTemplate(SimpMessagingTemplate messagingTemplate) {
+        this.messagingTemplate = messagingTemplate;
     }
 
     // ==========================================
